@@ -200,4 +200,4 @@ Only the listed commands work in each topic channel. Use **#bot** or **#test** f
 
 ## License
 
-MIT
+[Unlicense](https://unlicense.org) — public domain.
