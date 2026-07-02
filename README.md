@@ -198,6 +198,39 @@ Only the listed commands work in each topic channel. Use **#bot** or **#test** f
 4. Fill in the channel keys at the top of `server.ts` for the channels you want alerts posted to, and adjust `QUAKE_BBOX` and `NWS_ZONES` for your region.
 5. Run `server.ts` with `node --experimental-strip-types --env-file=.env --watch server.ts`.
 
+## How some things are counted
+
+### `!2byte` / `!stats` — repeater hash width
+
+MeshCore repeaters can be configured to use 1-, 2-, or 3-byte path prefixes when they relay adverts. Wider prefixes reduce collisions but take up more room in each packet. Rolling that number up across a mesh is a decent proxy for how far along a network is on the "moving to 2-byte prefixes" migration.
+
+Remote Terminal exposes an `/api/contacts/repeaters/advert-paths` endpoint that returns, per repeater, the recent advert paths it has seen. Each path has a hex string and a hop count. Bytes per hop = `len(path_hex) / 2 / path_len` — and because a repeater always encodes hop entries in its own `PATH_HASH_SIZE`, that number tells you the repeater's setting.
+
+The naive version — "look at the single most recent advert" — undercounts 2-byte repeaters for two reasons:
+
+1. A repeater's most recent advert may happen to be its single 1-byte edge case (or the path stored for it wasn't the most useful sample). Some repeaters emit adverts with different bph values over time.
+2. Repeaters that were heard once six months ago on 1-byte firmware and never again still count as "1-byte" even if they've since upgraded or died.
+
+`_count_repeater_types()` fixes both:
+
+- Ask for up to **20 recent adverts per repeater** and take the **max** bytes-per-hop seen. If a repeater ever emitted a 2-byte advert in that window, it's 2-byte-capable.
+- Ignore any repeater whose most recent advert is more than **30 days** old.
+
+Both refinements come from studying [CoreScope](https://github.com/Kpa-clawbot/CoreScope)'s approach, which reads the hash size directly from packet header bits and takes a running max across everything it's seen. We can't read raw header bits from the Remote Terminal API, but the derived bytes-per-hop is equivalent when the path is well-formed.
+
+### `!pathx` — extended path with repeater names
+
+MeshCore path hops are prefixes of a repeater's public key (usually 1 or 2 bytes). Multiple repeaters can share a prefix, so turning a path back into a list of names is a disambiguation problem. `_resolve_path_hops()` in `bot.py` works in four layers, each only used if the previous can't decide:
+
+1. **Adjacency** — if a candidate has a confirmed neighbor edge to an already-resolved hop (or to the sender/receiver at the ends), it wins.
+2. **Shared neighbors** — a candidate whose neighbor set overlaps the path's resolved pubkeys is more likely to be on the path.
+3. **GPS interpolation** — with the sender and receiver as anchors, interpolate an expected location for each remaining hop and pick the closest candidate.
+4. **Last seen** — tiebreaker for the recently-heard candidate.
+
+Layers 1 and 2 commit only on decisive evidence (best score ≥ 3× second-best), so thin evidence falls through to GPS rather than over-committing. Adjacency and neighbor data are precomputed by `server.ts` from the recent packet history and dumped to a JSON cache the bot reloads on mtime change.
+
+This is adapted from CoreScope's disambiguation gate — the specific thresholds and the layer ordering match theirs.
+
 ## License
 
 [Unlicense](https://unlicense.org) — public domain.
