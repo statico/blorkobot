@@ -16,6 +16,26 @@ const COMPANION_API_BASE = "http://127.0.0.1:4043";
 // clears any stuck state from long-running radio firmware.
 const DAILY_REBOOT_HOUR = 4;
 
+// Daily help/tip reminders at 3pm local (PST/PDT). #test fires at :00,
+// #bot fires at :01 — a minute apart so both messages reliably get out.
+const DAILY_TIP_HOUR = 15;
+const DAILY_TIP_BOT_MINUTE = 1;
+
+// Public channel welcome. This is the ONLY thing we ever send to Public —
+// nothing else may post there.
+// Text is 105 bytes / 121 with the sender name prepended — over the 120 byte
+// mesh limit, so if it gets clipped, trim here first.
+const PUBLIC_WELCOME_TEXT =
+  "⭐️ Welcome to Bay Area MeshCore! 🌉 See baymc.org for the channel list and join the Discord! ⭐️";
+
+// The welcome only goes out when newcomers are actually around: all three of
+// these must hold. Tuned to land ~1-2/day; adjust after watching real traffic.
+const WELCOME_MIN_GAP_H = 12; // hours since the last welcome
+const WELCOME_MIN_NEW = 3; // new-to-us speakers in Public since the last welcome
+const WELCOME_ACTIVE_MIN = 90; // Public must have talked within this many minutes
+const WELCOME_CHECK_MS = 10 * 60_000; // re-evaluate every 10 min
+const WELCOME_STATE_FILE = new URL("./welcome-state.json", import.meta.url).pathname;
+
 // MeshCore channel keys (hex). Fill in for your own deployment.
 const CHANNELS = {
   quake: "",
@@ -25,6 +45,9 @@ const CHANNELS = {
   power: "",
   alert: "",
   bot: "",
+  test: "",
+  public: "",
+  mcmonday: "",
 };
 
 // Bounding box: Bay Area + surrounding (from USGS-NWS-PLAN.md)
@@ -46,17 +69,40 @@ const RSS_URL = "https://bayareameshcore.com/rss.xml";
 const RSS_POLL_MS = 15 * 60_000; // 15 minutes
 
 const STATS_POLL_MS = 6 * 60 * 60_000; // 6 hours
+
+// SR telemetry poll times, local hours (server runs US/Pacific)
+const SR_TELEMETRY_HOURS = [0, 8, 18]; // midnight, 8am, 6pm
 const MSG_POLL_MS = 30_000; // 30s — low-traffic mesh, keep it responsive
 
 // Optional: public key of a repeater whose telemetry we poll. Leave blank to disable.
 const SR_REPEATER_KEY = "";
 
+// Daily clock sync for repeaters we administer, at 5:30am local (after the 4am
+// radio reboot). Our radio's key must be in each repeater's ACL at admin level.
+const CLOCK_SYNC_REPEATERS: { name: string; key: string }[] = [
+  // { name: "My Repeater", key: "<64-hex public key>" },
+];
+const CLOCK_SYNC_HOUR = 5;
+const CLOCK_SYNC_MINUTE = 30;
+const CLOCK_SYNC_TOLERANCE_S = 120; // don't touch the clock if within ±2 min
+const CLOCK_SYNC_RETRY_DELAY_MS = 20_000; // CLI round-trip is slow over lossy RF
+const CLOCK_SYNC_CLKREBOOT_WAIT_MS = 90_000; // reboot takes ~1-2 min to come back
+const CLOCK_SYNC_CLKREBOOT_REARM_MS = 7 * 24 * 60 * 60 * 1000; // re-allow clkreboot weekly
+const CLOCK_SYNC_STATE_FILE = new URL("./clock-sync-state.json", import.meta.url).pathname;
+
 const STATS_FILE = new URL("./stats.jsonl", import.meta.url).pathname;
 const REPEATER_STATS_FILE = new URL("./repeater-stats.jsonl", import.meta.url).pathname;
+const EVENTS_LOG_FILE = new URL("./logs/events.jsonl", import.meta.url).pathname;
+// Trim local logs once they exceed this size, keeping the most recent tail.
+// Bounds disk usage forever without logrotate-style external tooling.
+// At busy-mesh message volume (~400KB/h) 400MB keeps roughly a month.
+const LOG_MAX_BYTES = 1024 * 1024 * 1024; // 1GB per file
+const LOG_KEEP_BYTES = 400 * 1024 * 1024; // after trim: keep newest 400MB
+const LOG_TRIM_CHECK_BYTES = 16 * 1024 * 1024; // check size every ~16MB of appends
 
-const BETTERSTACK_HOST = process.env.BETTERSTACK_HOST ?? "";
-const BETTERSTACK_TOKEN = process.env.BETTERSTACK_TOKEN ?? "";
 const SR_REPEATER_PASSWORD = process.env.SR_REPEATER_PASSWORD ?? "";
+// Home Assistant webhook for SR telemetry (LAN-only); unset = don't push
+const HA_WEBHOOK_URL = process.env.HA_WEBHOOK_URL ?? "";
 
 const SEEN_FILE = new URL("./seen.json", import.meta.url).pathname;
 const SEEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -140,7 +186,20 @@ function clearPollError(tag: string): void {
 // Seen-ID tracking (persisted to disk)
 // ---------------------------------------------------------------------------
 
-import { readFileSync, writeFileSync, appendFileSync, renameSync } from "fs";
+import {
+  readFileSync,
+  writeFileSync,
+  appendFileSync,
+  renameSync,
+  statSync,
+  openSync,
+  readSync,
+  closeSync,
+  mkdirSync,
+} from "fs";
+import { dirname } from "path";
+import { spawn } from "child_process";
+import { parseVtecs, segmentsFor, formatTsunami } from "./tsunami.ts";
 
 let seen: Record<string, number> = {};
 
@@ -316,6 +375,12 @@ async function pollWeather(): Promise<void> {
       markSeen(f.id);
       newCount++;
 
+      // Same NTWC bulletin pollTsunami reads — this is its fallback, deduped by VTEC
+      if (event.startsWith("Tsunami")) {
+        for (const seg of segmentsFor(description ?? "", TSUNAMI_ZONES)) await handleTsunamiSegment(seg, "nws-alert");
+        continue;
+      }
+
       // Rate-limit: suppress same event type within cooldown (unless high severity)
       const now = Date.now();
       if (!NWS_HIGH_SEVERITY.has(severity) && weatherCooldowns[event] && now - weatherCooldowns[event] < NWS_COOLDOWN_MS) {
@@ -338,6 +403,57 @@ async function pollWeather(): Promise<void> {
     saveSeen();
   } catch (err) {
     logPollError("weather", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tsunami — polls the raw NTWC West Coast bulletin (TSUWCA) every 15s
+// ---------------------------------------------------------------------------
+
+const TSUNAMI_POLL_MS = 15_000;
+const TSUNAMI_ZONES = new Set(NWS_ZONES.split(","));
+const TSUNAMI_MAX_AGE_MS = 6 * 60 * 60_000; // ignore stale bulletins on startup
+const NWS_HEADERS = { "User-Agent": "blorkobot/1.0 meshcore-bot", Accept: "application/ld+json" };
+
+/** Post each new tsunami level for our zones once per event (VTEC tracking number) */
+async function handleTsunamiSegment(seg: string, source: string): Promise<void> {
+  const vtecs = parseVtecs(seg).filter((v) => v.cls === "O"); // drops the monthly tests
+  // A downgrade carries W CAN + Y NEW together — announce only the new level
+  const starts = vtecs.filter((v) => v.action !== "CAN" && v.action !== "EXP");
+  const ended = starts.length === 0;
+  for (const v of ended ? vtecs : starts) {
+    const startKey = `tsunami:${v.etn}:${v.sig}`;
+    const key = ended ? `${startKey}:end` : startKey;
+    if (isSeen(key) || (ended && !isSeen(startKey))) continue;
+    markSeen(key);
+    saveSeen();
+    const msg = formatTsunami(v.sig, ended, seg);
+    console.log(`[tsunami] ${msg}`);
+    await postAlert(CHANNELS.weather, msg);
+    logAlert("tsunami", { vtec: `${v.action}.${v.sig}.${v.etn}`, source });
+  }
+}
+
+async function pollTsunami(): Promise<void> {
+  try {
+    const opts = { headers: NWS_HEADERS, signal: AbortSignal.timeout(10_000) };
+    const res = await fetch("https://api.weather.gov/products/types/TSU/locations/WCA", opts);
+    if (!res.ok) throw new Error(`NWS TSU ${res.status}`);
+    const products: any[] = (await res.json())["@graph"] ?? [];
+    // Oldest first so a CAN never lands before the NEW it ends
+    for (const p of products.slice(0, 3).reverse()) {
+      if (isSeen(`tsuprod:${p.id}`)) continue;
+      if (Date.now() - new Date(p.issuanceTime).getTime() > TSUNAMI_MAX_AGE_MS) continue;
+      const pr = await fetch(`https://api.weather.gov/products/${p.id}`, { headers: NWS_HEADERS, signal: AbortSignal.timeout(10_000) });
+      if (!pr.ok) throw new Error(`NWS product ${pr.status}`);
+      const { productText } = await pr.json();
+      for (const seg of segmentsFor(productText ?? "", TSUNAMI_ZONES)) await handleTsunamiSegment(seg, "ntwc");
+      markSeen(`tsuprod:${p.id}`);
+      saveSeen();
+    }
+    clearPollError("tsunami");
+  } catch (err) {
+    logPollError("tsunami", err);
   }
 }
 
@@ -479,10 +595,14 @@ async function pollSpaceEvents(): Promise<void> {
 
 async function reverseGeocodeCity(x?: number, y?: number): Promise<string> {
   if (x == null || y == null) return "";
+  const lon = (x / 20037508.34) * 180;
+  const lat =
+    (Math.atan(Math.exp((y / 20037508.34) * Math.PI)) * 360) / Math.PI - 90;
+  return reverseGeocodeLatLon(lat, lon);
+}
+
+async function reverseGeocodeLatLon(lat: number, lon: number): Promise<string> {
   try {
-    const lon = (x / 20037508.34) * 180;
-    const lat =
-      (Math.atan(Math.exp((y / 20037508.34) * Math.PI)) * 360) / Math.PI - 90;
     const url =
       `https://nominatim.openstreetmap.org/reverse` +
       `?lat=${lat.toFixed(6)}&lon=${lon.toFixed(6)}&format=json&zoom=10`;
@@ -562,6 +682,69 @@ async function pollPowerOutages(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Military aircraft (ADS-B, same dbFlags military bit as !mil)
+// ---------------------------------------------------------------------------
+
+const MIL_CENTER = { lat: 37.6, lon: -122.3 }; // same as bot.py _BAY_AREA_CENTER
+const MIL_RADIUS_NM = 25; // tighter than !mil's 40 to leave out the Travis AFB pattern
+const MIL_POLL_MS = 2 * 60_000;
+// Not tuned yet: Bay Area military traffic volume is unknown. Check the
+// alert_posted "military" rows in logs/events.jsonl and adjust these.
+const MIL_MIN_GAP_MS = 30 * 60_000; // at most one alert per 30 min
+const MIL_MAX_PER_DAY = 6;
+let milLastPost = 0;
+let milDay = "";
+let milDayCount = 0; // ponytail: in-memory, resets on server restart
+
+async function fetchAdsb(lat: number, lon: number, nm: number): Promise<any[]> {
+  try {
+    const res = await fetch(`https://api.adsb.lol/v2/point/${lat}/${lon}/${nm}`, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) throw new Error(`adsb.lol ${res.status}`);
+    return (await res.json()).ac ?? [];
+  } catch (err) {
+    console.log(`[mil] adsb.lol failed, trying adsb.fi: ${err}`);
+    const res = await fetch(`https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${nm}`, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) throw new Error(`adsb.fi ${res.status}`);
+    return (await res.json()).aircraft ?? [];
+  }
+}
+
+async function pollMilitary(): Promise<void> {
+  try {
+    const aircraft = await fetchAdsb(MIL_CENTER.lat, MIL_CENTER.lon, MIL_RADIUS_NM);
+    const mil = aircraft.filter((a) =>
+      ((a.dbFlags ?? 0) & 1) && a.lat != null && a.lon != null &&
+      typeof a.alt_baro === "number" && a.alt_baro >= 200);
+    const day = new Date().toISOString().slice(0, 10);
+    if (day !== milDay) { milDay = day; milDayCount = 0; }
+
+    for (const a of mil) {
+      const id = `mil-${a.hex}-${day}`; // each airframe at most once per day
+      if (isSeen(id)) continue;
+      const cs = (a.flight ?? "").trim() || a.r || a.hex;
+      if (Date.now() - milLastPost < MIL_MIN_GAP_MS || milDayCount >= MIL_MAX_PER_DAY) {
+        console.log(`[mil] held (rate limit): ${cs}`);
+        continue; // not marked seen, so it can still post once the gap passes
+      }
+      markSeen(id);
+      const alt = a.alt_baro >= 1000 ? `${Math.round(a.alt_baro / 1000)}kft` : `${a.alt_baro}ft`;
+      const city = await reverseGeocodeLatLon(a.lat, a.lon);
+      const msg = `✈️ Military: ${[cs, a.t, alt].filter(Boolean).join(" ")} over ${city || "the Bay"}`;
+      console.log(`[mil] ${msg}`);
+      await sendChannelMessage(CHANNELS.alert, msg);
+      milLastPost = Date.now();
+      milDayCount++;
+      logAlert("military", { callsign: cs, type: a.t, hex: a.hex, alt: a.alt_baro, lat: a.lat, lon: a.lon, city });
+    }
+    if (!mil.length) console.log(`[mil] poll ok — none airborne (${aircraft.length} aircraft)`);
+    clearPollError("mil");
+    saveSeen();
+  } catch (err) {
+    logPollError("mil", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Bay Area MeshCore RSS Feed
 // ---------------------------------------------------------------------------
 
@@ -616,28 +799,57 @@ function truncate(s: string, maxLen: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// BetterStack logging
+// Local JSONL event logging (with size trim)
+// Every event type (alerts, mesh messages, byte-widths) appends one JSON line
+// to logs/events.jsonl. Stats and repeater telemetry keep their own files.
 // ---------------------------------------------------------------------------
 
-async function sendToBetterStack(
-  data: Record<string, unknown> | Record<string, unknown>[],
-): Promise<void> {
-  if (!BETTERSTACK_TOKEN || !BETTERSTACK_HOST) return;
+let logBytesSinceCheck = 0;
+
+/**
+ * Trim a JSONL file in place to its newest ~LOG_KEEP_BYTES by re-writing it
+ * atomically. Drops the partial first line and old data beyond that point.
+ */
+function trimLog(file: string): void {
   try {
-    const res = await fetch(`https://${BETTERSTACK_HOST}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${BETTERSTACK_TOKEN}`,
-      },
-      body: JSON.stringify(data),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      console.error(`  [betterstack] ${res.status}: ${body}`);
+    const size = statSync(file).size;
+    if (size <= LOG_MAX_BYTES) return;
+    const fd = openSync(file, "r");
+    try {
+      const buf = Buffer.alloc(LOG_KEEP_BYTES);
+      const bytesRead = readSync(fd, buf, 0, LOG_KEEP_BYTES, Math.max(0, size - LOG_KEEP_BYTES));
+      const text = buf.subarray(0, bytesRead).toString("utf-8");
+      const firstNl = text.indexOf("\n");
+      const tail = firstNl >= 0 ? text.slice(firstNl + 1) : text;
+      if (!tail) return;
+      const tmp = `${file}.tmp`;
+      writeFileSync(tmp, tail);
+      renameSync(tmp, file);
+      console.log(`[log] trimmed ${file} from ${(size / 1e6).toFixed(1)}MB to ${(tail.length / 1e6).toFixed(1)}MB`);
+    } finally {
+      closeSync(fd);
     }
   } catch (err) {
-    console.error("[betterstack] send error:", err);
+    console.error(`[log] trim failed for ${file}:`, err);
+  }
+}
+
+/** Append one JSON line; every so often, check whether the file needs trimming. */
+function appendEvent(file: string, entry: Record<string, unknown>): void {
+  const line = JSON.stringify(entry) + "\n";
+  appendFileSync(file, line);
+  logBytesSinceCheck += line.length;
+  if (logBytesSinceCheck >= LOG_TRIM_CHECK_BYTES) {
+    logBytesSinceCheck = 0;
+    trimLog(file);
+  }
+}
+
+function logEvents(entries: Record<string, unknown>[]): void {
+  if (entries.length === 0) return;
+  mkdirSync(dirname(EVENTS_LOG_FILE), { recursive: true });
+  for (const entry of entries) {
+    appendEvent(EVENTS_LOG_FILE, entry);
   }
 }
 
@@ -657,11 +869,10 @@ async function collectStats(): Promise<void> {
     }
 
     const entry = { dt: new Date().toISOString(), type: "mesh_stats", ...data };
-    appendFileSync(STATS_FILE, JSON.stringify(entry) + "\n");
+    appendEvent(STATS_FILE, entry);
     console.log("[stats] saved to", STATS_FILE);
 
     clearPollError("stats");
-    await sendToBetterStack(entry);
   } catch (err) {
     logPollError("stats", err);
   }
@@ -697,6 +908,33 @@ async function loginToRepeater(): Promise<boolean> {
 const REPEATER_STATUS_RETRIES = 3;
 const REPEATER_RETRY_DELAY_MS = 2000;
 
+/** POST an authenticated repeater endpoint, retrying over the lossy RF link. */
+async function fetchRepeaterEndpoint(path: string, tag: string): Promise<any | null> {
+  for (let attempt = 1; attempt <= REPEATER_STATUS_RETRIES; attempt++) {
+    const res = await fetch(
+      `${API_BASE}/api/contacts/${SR_REPEATER_KEY}/repeater/${path}`,
+      { method: "POST" },
+    );
+    if (res.ok) return await res.json();
+    const body = await res.text();
+    console.log(`[repeater] ${tag} attempt ${attempt}/${REPEATER_STATUS_RETRIES} failed (${res.status}): ${body}`);
+    if (attempt < REPEATER_STATUS_RETRIES) {
+      await new Promise((r) => setTimeout(r, REPEATER_RETRY_DELAY_MS));
+    }
+  }
+  return null;
+}
+
+/** Flatten the LPP sensor list into flat columns for the JSONL row. */
+function flattenLppSensors(sensors: any[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const s of sensors ?? []) {
+    if (s.type_name === "temperature") out.temperature_c = s.value;
+    else if (s.type_name === "voltage") out.lpp_voltage = s.value;
+  }
+  return out;
+}
+
 async function collectRepeaterStats(): Promise<void> {
   try {
     // Login first — repeater requires auth before responding to status
@@ -707,37 +945,34 @@ async function collectRepeaterStats(): Promise<void> {
       await new Promise((r) => setTimeout(r, REPEATER_RETRY_DELAY_MS));
     }
 
-    let res: Response | null = null;
-    for (let attempt = 1; attempt <= REPEATER_STATUS_RETRIES; attempt++) {
-      res = await fetch(
-        `${API_BASE}/api/contacts/${SR_REPEATER_KEY}/repeater/status`,
-        { method: "POST" },
-      );
-      if (res.ok) break;
-      const body = await res.text();
-      console.log(`[repeater] attempt ${attempt}/${REPEATER_STATUS_RETRIES} failed (${res.status}): ${body}`);
-      if (attempt < REPEATER_STATUS_RETRIES) {
-        await new Promise((r) => setTimeout(r, REPEATER_RETRY_DELAY_MS));
-      }
-    }
-    if (!res || !res.ok) return;
-    const data = await res.json();
+    const data = await fetchRepeaterEndpoint("status", "status");
+    // Temperature only comes back from LPP telemetry — status doesn't carry it
+    const lpp = await fetchRepeaterEndpoint("lpp-telemetry", "lpp");
+
+    // The link drops packets often enough that one half regularly comes back
+    // without the other — log whatever we did hear, skip only if both missed
+    if (!data && !lpp) return;
 
     // Strip telemetry_history array if present — keep only current values
-    delete data.telemetry_history;
+    if (data) delete data.telemetry_history;
 
     const entry = {
       dt: new Date().toISOString(),
       type: "repeater_status",
       repeater: "SR Repeater",
       repeater_key: SR_REPEATER_KEY,
-      ...data,
+      ...(data ?? {}),
+      ...(lpp ? flattenLppSensors(lpp.sensors) : {}),
     };
-    appendFileSync(REPEATER_STATS_FILE, JSON.stringify(entry) + "\n");
+    appendEvent(REPEATER_STATS_FILE, entry);
     console.log("[repeater] saved to", REPEATER_STATS_FILE);
+    if (HA_WEBHOOK_URL) {
+      fetch(HA_WEBHOOK_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(entry) })
+        .then((r) => console.log(`[repeater] HA push ${r.status}`))
+        .catch((err) => console.log("[repeater] HA push failed:", err));
+    }
 
     clearPollError("repeater");
-    await sendToBetterStack(entry);
   } catch (err) {
     logPollError("repeater", err);
   }
@@ -773,8 +1008,7 @@ async function collectRepeaterByteWidthStats(): Promise<void> {
       total: counts.single_byte + counts.double_byte + counts.triple_byte,
     };
     console.log(`[byte-widths] 1-byte=${counts.single_byte} 2-byte=${counts.double_byte} 3-byte=${counts.triple_byte}`);
-
-    await sendToBetterStack(entry);
+    logEvents([entry]);
   } catch (err) {
     logPollError("byte-widths", err);
   }
@@ -782,30 +1016,251 @@ async function collectRepeaterByteWidthStats(): Promise<void> {
 
 async function collectAllStats(): Promise<void> {
   await collectStats();
-  await collectRepeaterStats();
   await collectRepeaterByteWidthStats();
 }
 
+/**
+ * SR telemetry runs on its own wall-clock schedule rather than the 6h stats
+ * interval, so readings land at comparable times of day (solar panel, so the
+ * time of day matters). Re-arms after each run: the gaps are uneven and
+ * re-computing from local time keeps it right across DST.
+ */
+function scheduleRepeaterStats(): void {
+  const ms = Math.min(...SR_TELEMETRY_HOURS.map((h) => msUntilNext(h)));
+  const next = new Date(Date.now() + ms);
+  console.log(`[repeater] next telemetry poll at ${next.toLocaleString()} (in ${(ms / 3600_000).toFixed(2)}h)`);
+  setTimeout(() => {
+    collectRepeaterStats();
+    // Re-arm a minute later so the hour we just fired for is safely past
+    setTimeout(scheduleRepeaterStats, 60_000);
+  }, ms);
+}
+
 // ---------------------------------------------------------------------------
-// Message stream (every 30s — logs all mesh traffic to BetterStack)
+// Daily repeater clock sync (5:30am local)
 // ---------------------------------------------------------------------------
 
+/**
+ * State per repeater key. `clkrebootAt` guards the disruptive fast-clock
+ * recovery (clock reset + reboot): at most once per key per week, so a flaky
+ * link can't reboot the repeater every day but a genuinely re-fast clock
+ * still self-heals.
+ */
+type ClockSyncState = Record<string, { clkrebootAt?: number }>;
+
+let clockSyncState: ClockSyncState = {};
+
+function loadClockSyncState(): void {
+  try {
+    clockSyncState = JSON.parse(readFileSync(CLOCK_SYNC_STATE_FILE, "utf-8"));
+  } catch {
+    clockSyncState = {};
+  }
+}
+
+function saveClockSyncState(): void {
+  writeFileSync(CLOCK_SYNC_STATE_FILE, JSON.stringify(clockSyncState, null, 2));
+}
+
+/**
+ * Send a CLI command to a repeater via the RT command endpoint, retrying over
+ * the lossy RF link. RT returns HTTP 200 with "(no response...)" when the RF
+ * reply is lost — that counts as a miss and gets retried, not accepted.
+ * Falls back to the companion radio (admin on both repeaters) if this radio
+ * stays silent — e.g. when our own ACL entry lost admin perms and the
+ * repeater silently drops our commands (happened to BlorkoBot on one
+ * Repeatah, 2026-09-11).
+ * Returns [response text or null, the base URL that answered]. Callers should
+ * pass back the returned base for subsequent commands in the same exchange,
+ * so a companion-routed session isn't reset to the broken path.
+ */
+async function sendRepeaterCommand(
+  key: string,
+  command: string,
+  tag: string,
+  baseUrl: string = API_BASE,
+): Promise<[string | null, string]> {
+  for (let attempt = 1; attempt <= REPEATER_STATUS_RETRIES; attempt++) {
+    let response: string | null = null;
+    try {
+      const res = await fetch(`${baseUrl}/api/contacts/${key}/command`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command }),
+        signal: AbortSignal.timeout(45_000),
+      });
+      if (res.ok) {
+        response = String((await res.json()).response ?? "");
+      } else {
+        console.log(`[clocksync] ${tag} '${command}' attempt ${attempt}/${REPEATER_STATUS_RETRIES} failed (${res.status})`);
+      }
+    } catch (err) {
+      console.log(`[clocksync] ${tag} '${command}' attempt ${attempt}/${REPEATER_STATUS_RETRIES} error: ${getTransientCode(err) ?? err}`);
+    }
+    if (isRealResponse(response)) return [response, baseUrl];
+    if (attempt < REPEATER_STATUS_RETRIES) {
+      await new Promise((r) => setTimeout(r, CLOCK_SYNC_RETRY_DELAY_MS));
+    }
+  }
+  if (baseUrl === API_BASE) {
+    console.log(`[clocksync] ${tag}: silent on this radio, trying companion`);
+    const [viaCompanion, usedBase] = await sendRepeaterCommand(key, command, tag, COMPANION_API_BASE);
+    if (viaCompanion !== null) {
+      console.log(`[clocksync] ${tag}: got response via companion radio`);
+      return [viaCompanion, usedBase];
+    }
+  }
+  return [null, baseUrl];
+}
+
+/** Login to a repeater from the given radio so its CLI session secret is fresh. */
+async function repeaterLogin(key: string, baseUrl: string): Promise<void> {
+  try {
+    await fetch(`${baseUrl}/api/contacts/${key}/repeater/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: "" }),
+      signal: AbortSignal.timeout(20_000),
+    });
+  } catch {
+    // Login may not have been heard — try the commands anyway; the repeater
+    // keeps the session even if the ACK is lost over RF
+  }
+  await new Promise((r) => setTimeout(r, REPEATER_RETRY_DELAY_MS));
+}
+
+/** True when the response text is an actual reply (RT returns this string on silence). */
+function isRealResponse(response: string | null): response is string {
+  return response !== null && !response.startsWith("(no response");
+}
+
+/** Parse "HH:MM - D/M/YYYY UTC" from the firmware `clock` command (day-first). */
+function parseClockResponse(response: string): Date | null {
+  const m = response.match(/(\d{2}):(\d{2}) - (\d+)\/(\d+)\/(\d+) UTC/);
+  if (!m) return null;
+  const [, hh, mm, day, month, year] = m;
+  // Firmware prints UTC — construct the UTC instant, then read via local methods
+  const utc = new Date(Date.UTC(+year, +month - 1, +day, +hh, +mm, 0));
+  return isNaN(utc.getTime()) ? null : utc;
+}
+
+/**
+ * Sync one repeater's clock. MeshCore clocks only move forward:
+ * - behind -> `clock sync` sets it from our message timestamp
+ * - ahead -> `clkreboot` (reset + reboot), then `clock sync` — disruptive, so
+ *   done at most once per repeater per week (guarded in the state file)
+ */
+async function syncRepeaterClock(r: { name: string; key: string }): Promise<void> {
+  const tag = `${r.name} (${r.key.slice(0, 8)})`;
+  try {
+    // Blank login — we're already in the repeater's ACL at admin level.
+    await repeaterLogin(r.key, API_BASE);
+
+    let [response, cmdBase] = await sendRepeaterCommand(r.key, "clock", tag);
+    if (!isRealResponse(response)) {
+      console.log(`[clocksync] ${tag}: no clock reading, skipping today`);
+      logAlert("clock_sync", { repeater: r.name, outcome: "no_reading" });
+      return;
+    }
+    const before = parseClockResponse(response);
+    if (!before) {
+      console.log(`[clocksync] ${tag}: unparseable clock response '${response}', skipping`);
+      logAlert("clock_sync", { repeater: r.name, outcome: "unparseable", response });
+      return;
+    }
+    const deltaS = Math.round((before.getTime() - Date.now()) / 1000);
+    console.log(`[clocksync] ${tag}: clock reads ${response} (delta ${deltaS >= 0 ? "+" : ""}${(deltaS / 3600).toFixed(2)}h)`);
+
+    if (Math.abs(deltaS) <= CLOCK_SYNC_TOLERANCE_S) {
+      console.log(`[clocksync] ${tag}: within ±${CLOCK_SYNC_TOLERANCE_S}s, done`);
+      logAlert("clock_sync", { repeater: r.name, outcome: "in_tolerance", delta_s: deltaS });
+      return;
+    }
+
+    let outcome: string;
+
+    if (deltaS < 0) {
+      // Behind — plain forward sync
+      const [syncRes] = await sendRepeaterCommand(r.key, "clock sync", tag, cmdBase);
+      outcome = syncRes !== null && syncRes.includes("OK") ? "synced_forward" : "forward_failed";
+      console.log(`[clocksync] ${tag}: clock sync -> ${syncRes ?? "no reply"}`);
+    } else {
+      // Ahead — firmware refuses to move clocks backwards. Only fix: clkreboot
+      // (resets clock to 2024 + reboots), then a normal forward sync. The
+      // repeater is offline ~1-2 min, so at most once a week per repeater.
+      const st = (clockSyncState[r.key] ??= {});
+      if (st.clkrebootAt && Date.now() - st.clkrebootAt < CLOCK_SYNC_CLKREBOOT_REARM_MS) {
+        console.log(`[clocksync] ${tag}: still ahead but clkreboot done recently; leaving it`);
+        logAlert("clock_sync", { repeater: r.name, outcome: "ahead_reboot_recent", delta_s: deltaS });
+        return;
+      }
+      console.log(`[clocksync] ${tag}: clock is fast — sending clkreboot (repeater will reboot)`);
+      await sendRepeaterCommand(r.key, "clkreboot", tag, cmdBase);
+      st.clkrebootAt = Date.now();
+      saveClockSyncState();
+      outcome = "clkrebooted";
+
+      // Wait out the reboot before setting the time
+      await new Promise((r2) => setTimeout(r2, CLOCK_SYNC_CLKREBOOT_WAIT_MS));
+
+      // Re-login: reboot may have kept us in the ACL, but re-establish anyway
+      await repeaterLogin(r.key, cmdBase);
+
+      const [syncRes] = await sendRepeaterCommand(r.key, "clock sync", tag, cmdBase);
+      console.log(`[clocksync] ${tag}: post-reboot clock sync -> ${syncRes ?? "no reply"}`);
+      if (syncRes !== null && syncRes.includes("OK")) outcome = "clkrebooted_and_synced";
+    }
+
+    // Verify with a fresh reading
+    [response] = await sendRepeaterCommand(r.key, "clock", tag, cmdBase);
+    if (isRealResponse(response)) {
+      const after = parseClockResponse(response);
+      const afterDelta = after ? Math.round((after.getTime() - Date.now()) / 1000) : null;
+      console.log(`[clocksync] ${tag}: now reads ${response} (delta ${afterDelta ?? "?"}s)`);
+      logAlert("clock_sync", { repeater: r.name, outcome, delta_before_s: deltaS, delta_after_s: afterDelta });
+    } else {
+      console.log(`[clocksync] ${tag}: verify read failed (sync may still have worked)`);
+      logAlert("clock_sync", { repeater: r.name, outcome, delta_before_s: deltaS, verify: "no_response" });
+    }
+  } catch (err) {
+    console.error(`[clocksync] ${tag}: failed:`, err);
+  }
+}
+
+async function runClockSync(): Promise<void> {
+  for (const r of CLOCK_SYNC_REPEATERS) {
+    await syncRepeaterClock(r);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Message stream (every 30s — logs all mesh traffic to the local events log)
+// ---------------------------------------------------------------------------
+
+// Forward cursor. The messages API pages forward with a compound cursor:
+// `after` (received_at) + `after_id` (id) must be sent TOGETHER — after_id
+// alone is silently ignored, which re-fetched the newest 200 every poll and
+// re-logged them (hundreds of duplicate entries per message in events.jsonl).
 let lastMsgId: number | null = null;
+let lastMsgAt: number | null = null;
 
 async function pollMessages(): Promise<void> {
   try {
-    // On first run, just grab the latest message ID as our cursor
+    // On first run, just grab the latest message as our cursor
     if (lastMsgId === null) {
       const res = await fetch(`${API_BASE}/api/messages?limit=1`);
       if (!res.ok) throw new Error(`messages ${res.status}`);
       const msgs = await res.json();
-      if (msgs.length > 0) lastMsgId = msgs[0].id;
+      if (msgs.length > 0) {
+        lastMsgId = msgs[0].id;
+        lastMsgAt = msgs[0].received_at;
+      }
       console.log(`[messages] cursor initialized at id=${lastMsgId}`);
       return;
     }
 
     const res = await fetch(
-      `${API_BASE}/api/messages?after_id=${lastMsgId}&limit=200`,
+      `${API_BASE}/api/messages?after=${lastMsgAt ?? 0}&after_id=${lastMsgId}&limit=200`,
     );
     if (!res.ok) throw new Error(`messages ${res.status}`);
     const msgs: any[] = await res.json();
@@ -827,12 +1282,15 @@ async function pollMessages(): Promise<void> {
       paths: m.paths,
     }));
 
-    // Update cursor to latest
-    lastMsgId = Math.max(...msgs.map((m: any) => m.id));
+    // Update cursor: with the compound cursor the response is ordered
+    // received_at ASC, id ASC, so the last row is the newest by both keys.
+    const last = msgs[msgs.length - 1];
+    lastMsgId = last.id;
+    lastMsgAt = last.received_at;
     console.log(`[messages] ${msgs.length} new (cursor now id=${lastMsgId})`);
 
     clearPollError("messages");
-    await sendToBetterStack(entries);
+    logEvents(entries);
   } catch (err) {
     logPollError("messages", err);
   }
@@ -865,10 +1323,10 @@ async function dailyReboot(): Promise<void> {
   }
 }
 
-function msUntilNext(hour: number): number {
+function msUntilNext(hour: number, minute: number = 0): number {
   const now = new Date();
   const target = new Date(now);
-  target.setHours(hour, 0, 0, 0);
+  target.setHours(hour, minute, 0, 0);
   if (target <= now) target.setDate(target.getDate() + 1);
   return target.getTime() - now.getTime();
 }
@@ -884,6 +1342,261 @@ function scheduleDailyReboot(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Daily reminders — 3pm local: fixed reminder to #test, rotating tip to #bot
+// ---------------------------------------------------------------------------
+
+const TEST_REMINDER =
+  "📣 reminder: use !pathx for extended path, !patha for all paths, !help for more";
+
+const BOT_TIPS: string[] = [
+  "!pathx shows your extended path with per-hop distance",
+  "!patha lists all known paths to you, not just the active one",
+  "!ping replies with SNR & path so you can check signal quality",
+  '!w <loc> gives current weather. Try !w 95110 or !w "san jose"',
+  "!quake shows recent earthquakes nearby. !quake 4 for M4+ only",
+  "!channels lists the most popular hashtag channels on the mesh",
+  "!alerts shows active NWS weather alerts in your state",
+  "!fire shows recent CAL FIRE incidents nearby",
+  "!power checks PG&E outages near you",
+  "!space shows recent space weather events (solar flares, etc)",
+  "!sun gives sunrise/sunset times for your location",
+  "!tide shows tide times for nearby NOAA stations",
+  "!stats shows mesh health metrics for the last 24h",
+  "!ai <question> asks an AI a quick question",
+  "!stock <symbol> shows the latest stock price",
+  "!sky <loc> shows interesting aircraft overhead",
+  "!blimp <loc> finds blimps & airships near you",
+  "!tfr shows active FAA temporary flight restrictions",
+  "!haiku <subject> writes you a haiku",
+  "!trivia starts a trivia question — first correct answer wins",
+  "!8ball asks the magic 8-ball a question",
+  "!joke tells a joke",
+  "!dadjoke serves up a dad joke",
+  "!riddle gives you a riddle to solve",
+  "!catfact shares a random cat fact",
+];
+
+function dayOfYear(d = new Date()): number {
+  const start = new Date(d.getFullYear(), 0, 0);
+  const diff = d.getTime() - start.getTime();
+  return Math.floor(diff / 86_400_000);
+}
+
+async function postTestReminder(): Promise<void> {
+  console.log("[reminders] posting #test reminder");
+  try {
+    await sendChannelMessage(CHANNELS.test, TEST_REMINDER);
+  } catch (err) {
+    console.error("[reminders] #test failed:", err);
+  }
+}
+
+async function postBotTip(): Promise<void> {
+  const idx = dayOfYear() % BOT_TIPS.length;
+  console.log(`[reminders] posting #bot tip (idx ${idx})`);
+  try {
+    await sendChannelMessage(CHANNELS.bot, `📣 tip: ${BOT_TIPS[idx]}`);
+  } catch (err) {
+    console.error("[reminders] #bot failed:", err);
+  }
+}
+
+function scheduleDaily(label: string, hour: number, minute: number, fn: () => Promise<void>): void {
+  const ms = msUntilNext(hour, minute);
+  const next = new Date(Date.now() + ms);
+  console.log(`[reminders] next ${label} at ${next.toLocaleString()} (in ${(ms / 3600_000).toFixed(2)}h)`);
+  setTimeout(() => {
+    fn();
+    setInterval(fn, 24 * 60 * 60 * 1000);
+  }, ms);
+}
+
+function scheduleDailyReminders(): void {
+  scheduleDaily("#test reminder", DAILY_TIP_HOUR, 0, postTestReminder);
+  scheduleDaily("#bot tip", DAILY_TIP_HOUR, DAILY_TIP_BOT_MINUTE, postBotTip);
+  scheduleDaily("#mcmonday recap (Tue only)", 9, 0, postMcmondaySummary);
+}
+
+// Run a bot.py expression inside the RT container (same env + /app/data as the
+// live fanout) and return its JSON result. `ns` is the bot module's namespace.
+function runBotExpr(expr: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const py = `import sys, json; ns = {"__name__": "botjob"}; exec(sys.stdin.read(), ns); print(json.dumps(${expr}))`;
+    const p = spawn("docker", ["exec", "-i", "-w", "/app", "meshcore-bot", "python3", "-c", py]);
+    let out = "";
+    let err = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (err += d));
+    p.on("error", reject);
+    p.on("close", (code) => {
+      if (code !== 0) return reject(new Error(`exit ${code}: ${err.slice(-300)}`));
+      try {
+        resolve(JSON.parse(out.trim().split("\n").pop() || "null"));
+      } catch (e) {
+        reject(e);
+      }
+    });
+    p.stdin.end(readFileSync(new URL("./bot.py", import.meta.url)));
+  });
+}
+
+// Tuesday-morning recap of Monday's #mcmonday check-ins (same output as !mcmonday).
+async function postMcmondaySummary(): Promise<void> {
+  if (new Date().getDay() !== 2) return;
+  try {
+    const msgs: string[] = await runBotExpr(`ns["cmd_mcmonday"](budget=60)`);
+    if (!Array.isArray(msgs) || !msgs.length || / 0 check-ins/.test(msgs[0])) {
+      console.log("[mcmonday] no check-ins this week, skipping recap");
+      return;
+    }
+    for (const [i, m] of msgs.slice(0, 3).entries()) {
+      if (i) await new Promise((r) => setTimeout(r, 10000));
+      await sendChannelMessage(CHANNELS.mcmonday, m);
+    }
+    console.log(`[mcmonday] posted recap (${Math.min(msgs.length, 3)} msgs)`);
+  } catch (err) {
+    console.error("[mcmonday] recap failed:", err);
+  }
+}
+
+function scheduleClockSync(): void {
+  loadClockSyncState();
+  scheduleDaily("repeater clock sync", CLOCK_SYNC_HOUR, CLOCK_SYNC_MINUTE, runClockSync);
+}
+
+// ---------------------------------------------------------------------------
+// Public channel welcome — only when newcomers show up, nothing else
+// ---------------------------------------------------------------------------
+
+type WelcomeState = {
+  speakers: Record<string, number>; // pubkey -> unix sec first heard in Public
+  newSinceWelcome: number;
+  lastWelcomeAt: number; // unix sec
+};
+
+let welcomeState: WelcomeState = { speakers: {}, newSinceWelcome: 0, lastWelcomeAt: 0 };
+
+function loadWelcomeState(): void {
+  try {
+    const s = JSON.parse(readFileSync(WELCOME_STATE_FILE, "utf-8"));
+    welcomeState = {
+      speakers: s.speakers ?? {},
+      newSinceWelcome: s.newSinceWelcome ?? 0,
+      lastWelcomeAt: s.lastWelcomeAt ?? 0,
+    };
+  } catch {
+    welcomeState = { speakers: {}, newSinceWelcome: 0, lastWelcomeAt: 0 };
+  }
+}
+
+function saveWelcomeState(): void {
+  writeFileSync(WELCOME_STATE_FILE, JSON.stringify(welcomeState, null, 2));
+}
+
+/**
+ * Public traffic, newest first. Note: the API's `channel_key` param is silently
+ * ignored (it returns every channel) — `conversation_key` is the one that
+ * actually filters.
+ */
+async function fetchPublicMessages(limit = 200): Promise<any[]> {
+  const res = await fetch(
+    `${API_BASE}/api/messages?conversation_key=${CHANNELS.public}&limit=${limit}`,
+  );
+  if (!res.ok) throw new Error(`http ${res.status}`);
+  return (await res.json()) as any[];
+}
+
+// Deepest backlog the API will give us in one shot: 1000 is the hard max (2000
+// returns 422) and reaches ~6 days / ~79 speakers. There's no way to page
+// further back — `before_id` is silently ignored and just re-returns the head.
+// Priming shallow would leave regulars looking new and over-fire the welcome.
+const WELCOME_PRIME_LIMIT = 1000;
+
+/** Repeaters (type 2) and room servers (type 3) — chatter from these isn't a newcomer. */
+async function fetchNonCompanionKeys(): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const c of await fetchAllContacts()) {
+    if (c.type !== 1 && c.public_key) out.add(String(c.public_key).toLowerCase());
+  }
+  return out;
+}
+
+/**
+ * Fires the welcome only when real newcomers have spoken in Public recently.
+ * Adverts deliberately don't count — the mesh is full of bots and repeaters
+ * advertising constantly, so speech is the signal that a person is actually there.
+ *
+ * No cursor: we re-read the last 200 Public messages each pass and dedupe
+ * against the persisted speaker set, so a missed poll or restart self-heals.
+ */
+async function checkPublicWelcome(): Promise<void> {
+  try {
+    // First ever run: learn who's already here from the full backlog, post nothing.
+    const priming = Object.keys(welcomeState.speakers).length === 0;
+    const msgs = await fetchPublicMessages(priming ? WELCOME_PRIME_LIMIT : 200);
+    // Bots (🤖 in their contact name) aren't newcomers, whatever they say.
+    const incoming = msgs.filter(
+      (m) => !m.outgoing && m.sender_key && !String(m.sender_name ?? "").includes("🤖"),
+    );
+    if (incoming.length === 0) return;
+
+    const nonCompanions = await fetchNonCompanionKeys();
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    let fresh = 0;
+    for (const m of incoming) {
+      const key = String(m.sender_key).toLowerCase();
+      if (welcomeState.speakers[key]) continue;
+      // Contacts we've never adverted count as companions — hearing a message
+      // before the advert is normal, and missing a real newcomer is the worse error.
+      if (nonCompanions.has(key)) continue;
+      welcomeState.speakers[key] = m.received_at ?? nowSec;
+      fresh++;
+    }
+
+    if (priming) {
+      // Start the clock now so we don't post the instant 3 newcomers show up
+      welcomeState.lastWelcomeAt = nowSec;
+      saveWelcomeState();
+      console.log(`[welcome] primed with ${fresh} known Public speakers, nothing sent`);
+      return;
+    }
+
+    welcomeState.newSinceWelcome += fresh;
+
+    const quietMin = (nowSec - (incoming[0].received_at ?? 0)) / 60;
+    const gapH = welcomeState.lastWelcomeAt
+      ? (nowSec - welcomeState.lastWelcomeAt) / 3600
+      : Infinity;
+    const ready =
+      gapH >= WELCOME_MIN_GAP_H &&
+      welcomeState.newSinceWelcome >= WELCOME_MIN_NEW &&
+      quietMin <= WELCOME_ACTIVE_MIN;
+
+    if (!ready) {
+      if (fresh > 0) {
+        console.log(
+          `[welcome] +${fresh} new speaker(s) — ${welcomeState.newSinceWelcome}/${WELCOME_MIN_NEW} new, ` +
+            `${gapH === Infinity ? "never sent" : gapH.toFixed(1) + "h gap"}, quiet ${quietMin.toFixed(0)}m`,
+        );
+      }
+      saveWelcomeState();
+      return;
+    }
+
+    await sendChannelMessage(CHANNELS.public, PUBLIC_WELCOME_TEXT);
+    console.log(
+      `[welcome] sent — ${welcomeState.newSinceWelcome} new speakers, ${gapH.toFixed(1)}h since last`,
+    );
+    welcomeState.newSinceWelcome = 0;
+    welcomeState.lastWelcomeAt = nowSec;
+    saveWelcomeState();
+  } catch (err) {
+    console.error("[welcome] check failed:", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Pathx cache — precomputed disambiguation data for !pathx in bot.py
 // ---------------------------------------------------------------------------
 
@@ -895,17 +1608,33 @@ type PathxCandidate = {
   last_seen: number;
 };
 
+const CONTACTS_PAGE = 1000; // RT caps /api/contacts?limit at 1000
+const CONTACTS_MAX = 10000; // safety cap so a misbehaving API can't spin forever
+
+async function fetchAllContacts(): Promise<any[]> {
+  const out: any[] = [];
+  for (let offset = 0; offset < CONTACTS_MAX; offset += CONTACTS_PAGE) {
+    const res = await fetch(
+      `${API_BASE}/api/contacts?limit=${CONTACTS_PAGE}&offset=${offset}`,
+    );
+    if (!res.ok) throw new Error(`http ${res.status}`);
+    const page = (await res.json()) as any[];
+    out.push(...page);
+    if (page.length < CONTACTS_PAGE) break;
+  }
+  return out;
+}
+
 async function buildPathxCache(): Promise<void> {
   try {
-    const [contactsR, advertsR, configR] = await Promise.all([
-      fetch(`${API_BASE}/api/contacts?limit=1000`),
+    const [contacts, advertsR, configR] = await Promise.all([
+      fetchAllContacts(),
       fetch(`${API_BASE}/api/contacts/repeaters/advert-paths`),
       fetch(`${API_BASE}/api/radio/config`),
     ]);
-    if (!contactsR.ok || !advertsR.ok || !configR.ok) {
-      throw new Error(`http ${contactsR.status}/${advertsR.status}/${configR.status}`);
+    if (!advertsR.ok || !configR.ok) {
+      throw new Error(`http ${advertsR.status}/${configR.status}`);
     }
-    const contacts = (await contactsR.json()) as any[];
     const adverts = (await advertsR.json()) as any[];
     const config = (await configR.json()) as any;
 
@@ -1000,7 +1729,7 @@ async function buildPathxCache(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Alert event logging (fired inline when alerts are posted)
+// Alert event logging (fired inline when alerts are posted; -> events log)
 // ---------------------------------------------------------------------------
 
 function logAlert(
@@ -1013,7 +1742,7 @@ function logAlert(
     alert_type: alertType,
     ...details,
   };
-  sendToBetterStack(entry);
+  logEvents([entry]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,14 +1752,17 @@ function logAlert(
 console.log("BlorkoBot alert server starting...");
 console.log(`  USGS poll: every ${QUAKE_POLL_MS / 1000}s (M${QUAKE_MIN_MAG}+ in bbox)`);
 console.log(`  NWS poll:  every ${NWS_POLL_MS / 1000}s (zones: ${NWS_ZONES})`);
+console.log(`  TSU poll:  every ${TSUNAMI_POLL_MS / 1000}s (NTWC TSUWCA)`);
 console.log(`  FIRE poll: every ${FIRE_POLL_MS / 1000}s (CAL FIRE active wildfires)`);
 console.log(`  Space:    every ${SPACE_POLL_MS / 1000}s (M-class+ flares, Kp 5+ storms)`);
 console.log(`  Power:    every ${POWER_POLL_MS / 1000}s (PG&E Bay Area outages)`);
 console.log(`  RSS:      every ${RSS_POLL_MS / 1000}s (bayareameshcore.com blog)`);
 console.log(`  Stats:     every ${STATS_POLL_MS / 1000 / 3600}h -> ${STATS_FILE}`);
-console.log(`  Repeater:  every ${STATS_POLL_MS / 1000 / 3600}h -> ${REPEATER_STATS_FILE}`);
-console.log(`  Messages:  every ${MSG_POLL_MS / 1000}s -> BetterStack`);
-console.log(`  BetterStack: ${BETTERSTACK_TOKEN ? "enabled" : "disabled (set BETTERSTACK_TOKEN)"}`);
+console.log(`  Repeater:  at ${SR_TELEMETRY_HOURS.map((h) => `${h}:00`).join(", ")} local -> ${REPEATER_STATS_FILE}`);
+console.log(`  ClockSync: ${CLOCK_SYNC_HOUR}:${String(CLOCK_SYNC_MINUTE).padStart(2, "0")} daily (${CLOCK_SYNC_REPEATERS.map((r) => r.name).join(", ")})`);
+console.log(`  Messages:  every ${MSG_POLL_MS / 1000}s -> ${EVENTS_LOG_FILE}`);
+console.log(`  Welcome:   every ${WELCOME_CHECK_MS / 60_000}m check -> Public (${WELCOME_MIN_GAP_H}h gap, ${WELCOME_MIN_NEW} new speakers, active <${WELCOME_ACTIVE_MIN}m)`);
+console.log(`  Logs:      local, trimmed to ${(LOG_KEEP_BYTES / 1024 / 1024)}MB once ${(LOG_MAX_BYTES / 1024 / 1024)}MB`);
 
 loadSeen();
 console.log(`  Loaded ${Object.keys(seen).length} seen IDs from disk`);
@@ -1038,9 +1770,11 @@ console.log(`  Loaded ${Object.keys(seen).length} seen IDs from disk`);
 // Run immediately, then on interval
 pollQuakes();
 pollWeather();
+pollTsunami();
 pollFires();
 pollSpaceEvents();
 pollPowerOutages();
+pollMilitary();
 pollRSS();
 collectAllStats();
 pollMessages();
@@ -1048,12 +1782,21 @@ buildPathxCache();
 
 setInterval(pollQuakes, QUAKE_POLL_MS);
 setInterval(pollWeather, NWS_POLL_MS);
+setInterval(pollTsunami, TSUNAMI_POLL_MS);
 setInterval(pollFires, FIRE_POLL_MS);
 setInterval(pollSpaceEvents, SPACE_POLL_MS);
 setInterval(pollPowerOutages, POWER_POLL_MS);
+setInterval(pollMilitary, MIL_POLL_MS);
 setInterval(pollRSS, RSS_POLL_MS);
 setInterval(collectAllStats, STATS_POLL_MS);
 setInterval(pollMessages, MSG_POLL_MS);
 setInterval(buildPathxCache, PATHX_CACHE_POLL_MS);
 
 scheduleDailyReboot();
+scheduleDailyReminders();
+scheduleRepeaterStats();
+scheduleClockSync();
+
+loadWelcomeState();
+checkPublicWelcome();
+setInterval(checkPublicWelcome, WELCOME_CHECK_MS);

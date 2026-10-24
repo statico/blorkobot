@@ -1,0 +1,58 @@
+
+WEPA41 PAAQ 300820
+TSUWCA
+BULLETIN
+Tsunami Message Number 10
+NWS National Tsunami Warning Center Palmer AK
+120 AM PDT Wed Jul 30 2025
+CAZ103-101-300950-
+/O.CON.PAAQ.TS.W.0016.000000T0000Z-000000T0000Z/
+Coastal areas between and including Cape Mendocino,
+California to The Oregon/Cal. Border
+120 AM PDT Wed Jul 30 2025
+....THE TSUNAMI WARNING REMAINS IN EFFECT FOR THE COASTAL
+  AREAS OF CALIFORNIA FROM CAPE MENDOCINO CALIFORNIA TO THE
+  OREGON/CAL. BORDER...
+If you are located in this coastal area, move inland
+to higher ground.
+Tsunami warnings mean that a tsunami with significant
+inundation is possible or is already occurring.  Tsunamis are
+a series of waves dangerous many hours after initial arrival
+time.  The first wave may not be the largest.
+At 425 PM Pacific Daylight Time on July 29 an earthquake with
+preliminary magnitude 8.8 occurred 80 miles southeast of
+Petropavlovsk Kamchatka.
+The tsunami warning will remain in effect until further notice.
+Refer to the internet site tsunami.gov for more information.
+$$
+PZZ530-531-CAZ043-354-362-366-367-552-087-549-550-349-350-
+340>342-346-529-530-006-505-506-508-509-109-104-300950-
+/O.CON.PAAQ.TS.Y.0016.000000T0000Z-000000T0000Z/
+Coastal areas between and including The Cal./Mexico Border
+to Cape Mendocino, California
+120 AM PDT Wed Jul 30 2025
+....THE TSUNAMI ADVISORY REMAINS IN EFFECT FOR THE COASTAL
+  AREAS OF CALIFORNIA FROM THE CAL./MEXICO BORDER TO CAPE
+  MENDOCINO CALIFORNIA...
+If you are located in this coastal area, move off the
+beach and out of harbors and marinas.
+Tsunami advisories mean that a tsunami capable of producing
+strong currents or waves dangerous to persons in or very near
+the water is expected or is already occurring.  Areas in the
+advisory should not expect widespread inundation.  Tsunamis
+are a series of waves dangerous many hours after initial
+arrival time.  The first wave may not be the largest.
+At 425 PM Pacific Daylight Time on July 29 an earthquake with
+preliminary magnitude 8.8 occurred 80 miles southeast of
+Petropavlovsk Kamchatka.
+Estimated tsunami start times for selected sites are;
+Port San Luis      California         1235 AM.  PDT. July 30.
+San Francisco      California         1240 AM.  PDT. July 30.
+Santa Barbara      California         1245 AM.  PDT. July 30.
+Los Angeles Harbor California          100 AM.  PDT. July 30.
+Newport Beach      California          110 AM.  PDT. July 30.
+La Jolla           California          110 AM.  PDT. July 30.
+Oceanside          California          115 AM.  PDT. July 30.
+The tsunami advisory will remain in effect until further notice.
+Refer to the internet site tsunami.gov for more information.
+$$

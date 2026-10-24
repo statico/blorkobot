@@ -1,5 +1,6 @@
 """BlorkoBot — multi-command mesh radio bot."""
 
+import difflib
 import html as html_mod
 import json
 import logging
@@ -23,6 +24,7 @@ import xml.etree.ElementTree as ET
 # Remote Terminal for MeshCore HTTP API base URL. The fanout plugin calls
 # back into RT to read messages, look up contacts, send DMs, etc.
 _API = "http://127.0.0.1:8000"
+_RT_API = _API  # bot runs inside the RT container; host :4042 maps to :8000
 
 # Persistent state and on-disk caches. Most live under data/ alongside this
 # file; tide-station list is large and rarely changes, so we park it in /tmp.
@@ -36,21 +38,23 @@ _TIDE_STATION_CACHE = "/tmp/noaa_tide_stations.json"  # NOAA tide-station lookup
 # API keys for external services. Blank = command disabled / degraded.
 _N2YO_KEY = ""          # https://www.n2yo.com — ISS pass predictions for !iss <location>
 _BAY511_API_KEY = ""    # https://511.org — Bay Area traffic/incidents for !511
-_GROQ_KEY = ""          # https://groq.com — LLM for !ai, !sonnet, !haiku
+_GROQ_KEY = ""          # https://groq.com — LLM for !ai, !sonnet, !haiku, !news, place-name fixes
 _AERODATABOX_KEY = ""   # https://aerodatabox.com — flight status for !flight (via MagicAPI)
 
 # Tunables
 _MEMORY_MAX_KEYS = 100      # max keys in the !set/!get store
 _ISS_NORAD_ID = 25544       # NORAD catalog ID for the ISS (used with N2YO)
 _ISS_MIN_ELEVATION = 20     # degrees — skip ISS passes lower than this
-_MESH_MAX_BYTES = 120       # MeshCore single-message byte limit
+_MESH_MAX_BYTES = 139       # "BlorkoBot 🤖: " + text must be <= 155 bytes (RT rejects longer)
 _MAX_MESSAGES = 3           # max chunks any single reply is allowed to split into
 _AI_MAX_TOKENS = 800        # cap on Groq response length
-_AI_MODEL = "openai/gpt-oss-20b"  # Groq model id for !ai/!sonnet/!haiku
+_AI_MODEL = "openai/gpt-oss-20b"            # Groq model id for !ai/!sonnet/!haiku
+_AI_FALLBACK_MODEL = "llama-3.3-70b-versatile"  # used if _AI_MODEL fails
 
 # Region defaults — many commands are tuned for the SF Bay Area
 _PT = ZoneInfo("America/Los_Angeles")   # local timezone for !sun, !iss, etc.
 _BAY_AREA_CENTER = (37.6, -122.3)       # lat/lon for default-radius aviation lookups
+_HOME = (37.6, -122.3)                  # bot's own location, for !where and path distances
 
 # Bot-output profanity filter: regex of explicit /phrases to silently drop from
 # any reply (case-insensitive). Default `(?!)` never matches. Add `|`-separated
@@ -69,6 +73,39 @@ def _fetch(url, timeout=8, headers=None):
 
 def _fetch_json(url, timeout=8, headers=None):
     return json.loads(_fetch(url, timeout=timeout, headers=headers))
+
+
+_CONTACTS_PAGE = 1000  # RT caps /api/contacts?limit at 1000
+_CONTACTS_MAX = 10000  # safety cap so a misbehaving API can't spin forever
+_CONTACTS_TTL = 20.0
+_CONTACTS_CACHE = None
+_CONTACTS_CACHE_TS = 0.0
+
+
+def _fetch_all_contacts():
+    """Every contact, paging past RT's 1000-row limit via offset.
+
+    Memoized briefly because _get_contact_path() runs on every inbound message
+    and would otherwise issue a fresh multi-page fetch each time.
+    """
+    global _CONTACTS_CACHE, _CONTACTS_CACHE_TS
+    if _CONTACTS_CACHE is not None and time.time() - _CONTACTS_CACHE_TS < _CONTACTS_TTL:
+        return _CONTACTS_CACHE
+    out = []
+    offset = 0
+    while offset < _CONTACTS_MAX:
+        page = _fetch_json(
+            f"{_API}/api/contacts?limit={_CONTACTS_PAGE}&offset={offset}"
+        )
+        if not page:
+            break
+        out.extend(page)
+        if len(page) < _CONTACTS_PAGE:
+            break
+        offset += _CONTACTS_PAGE
+    _CONTACTS_CACHE = out
+    _CONTACTS_CACHE_TS = time.time()
+    return out
 
 
 _PATHX_CACHE = None
@@ -291,15 +328,15 @@ def cmd_help2():
 
 
 def cmd_help3():
-    return "!define !wiki !dadjoke !time !aqi !fact !joke !quote !advice !catfact (!help4)"
+    return "!define !wiki !dadjoke !time !aqi !fact !joke !quote !advice !catfact !whois !where !news (!help4)"
 
 
 def cmd_help4():
-    return "!riddle !country !apod !cocktail !futurama !simpsons !river !wave !otd !zip !who !pathx !set !get !del !advert !stats !leaderboard !chess (!help5)"
+    return "!riddle !country !apod !cocktail !futurama !simpsons !river !wave !otd !zip !pathx !pathxkm !pathy !pathz !set !get !del !advert !stats !meshstats !leaderboard !chess (!help5)"
 
 
 def cmd_help5():
-    return "!flight !delays !sky !mil !blimp !tfr"
+    return "!flight !delays !sky !mil !blimp !tfr !mcmonday"
 
 
 def cmd_docs():
@@ -311,7 +348,7 @@ def _get_contact_path(sender_key):
     if not sender_key:
         return None, None
     try:
-        contacts = _fetch_json(f"{_API}/api/contacts?limit=1000")
+        contacts = _fetch_all_contacts()
         for c in contacts:
             pk = (c.get("public_key") or "").lower()
             if pk == sender_key.lower():
@@ -327,18 +364,39 @@ def _get_contact_path(sender_key):
     return None, None
 
 
-def cmd_path(path, path_bytes_per_hop, transit_ms=None):
+def cmd_packet(packet_hash):
+    """Analyzer URLs for the packet that delivered this message (hash from RT)."""
+    if not packet_hash:
+        return "No packet info available."
+    # One URL per mesh message so the @[sender] mention never pushes past the limit.
+    return [
+        f"00id: analyzer.00id.net/#/packets/{packet_hash}",
+        f"lm: analyzer.letsmesh.net/#/packets/{packet_hash}",
+    ]
+
+
+def cmd_path(path, path_bytes_per_hop, transit_ms=None, extras=(), budget=None):
+    """Hop summary. `extras` (e.g. '~38mi') are appended after
+    'to BlorkoBot', dropped from the end until the reply fits `budget` bytes."""
     suffix = f" - {transit_ms / 1000:.1f}s to BlorkoBot" if transit_ms is not None else " to BlorkoBot"
     if not path:
-        return f"direct{suffix}"
-    chars_per_hop = (path_bytes_per_hop or 1) * 2
-    hops = [path[i:i + chars_per_hop].upper() for i in range(0, len(path), chars_per_hop)]
-    label = "hop" if len(hops) == 1 else "hops"
-    return f"{len(hops)} {label} - {chr(0x2192).join(hops)}{suffix}"
+        base = f"direct{suffix}"
+    else:
+        chars_per_hop = (path_bytes_per_hop or 1) * 2
+        hops = [path[i:i + chars_per_hop].upper() for i in range(0, len(path), chars_per_hop)]
+        label = "hop" if len(hops) == 1 else "hops"
+        width = f", {path_bytes_per_hop}-byte" if path_bytes_per_hop in (1, 2, 3) else ""
+        base = f"{len(hops)} {label}{width} - {chr(0x2192).join(hops)}{suffix}"
+    budget = budget or _MESH_MAX_BYTES
+    extras = [e for e in extras if e]
+    while extras and len(", ".join([base] + extras).encode("utf-8")) > budget:
+        extras.pop()
+    return ", ".join([base] + extras)
 
 
-def cmd_pathx(path, path_bytes_per_hop, sender_key):
-    """Extended path info: walk each hop, look up the repeater by prefix."""
+def _resolve_hops(path, path_bytes_per_hop, sender_key):
+    """Resolve each hop to a repeater. Returns (hops, bph, resolved, sender_gps, self_pt)
+    with resolved = [(PREFIX, name|None, lat, lon, ambiguous)], or an error string."""
     p, bph = path, path_bytes_per_hop
     if not p and sender_key:
         p, bph = _get_contact_path(sender_key)
@@ -348,13 +406,12 @@ def cmd_pathx(path, path_bytes_per_hop, sender_key):
     chars_per_hop = bph * 2
     hex_path = p.lower()
     hops = [hex_path[i:i + chars_per_hop] for i in range(0, len(hex_path), chars_per_hop)]
-
     cache = _load_pathx_cache()
     contacts = None
     sender_gps = None
     if sender_key or not cache:
         try:
-            contacts = _fetch_json(f"{_API}/api/contacts?limit=1000")
+            contacts = _fetch_all_contacts()
         except Exception:
             contacts = None
     if sender_key and contacts:
@@ -378,14 +435,14 @@ def cmd_pathx(path, path_bytes_per_hop, sender_key):
                 continue
             synth.setdefault(pk[:2], []).append({
                 "pubkey": pk,
-                "name": c.get("name") or "?",
+                "name": c.get("name") or "unknown",
                 "lat": c.get("lat") or 0,
                 "lon": c.get("lon") or 0,
                 "last_seen": c.get("last_seen") or 0,
             })
         cache = {
             "prefixes": synth,
-            "self": {"pubkey": "", "lat": 37.6, "lon": -122.3},
+            "self": {"pubkey": "", "lat": _HOME[0], "lon": _HOME[1]},
             "adj": {},
         }
 
@@ -397,22 +454,63 @@ def cmd_pathx(path, path_bytes_per_hop, sender_key):
         else:
             resolved.append((
                 hop.upper(),
-                cand.get("name") or "?",
+                cand.get("name") or "unknown",
                 cand.get("lat") or 0.0,
                 cand.get("lon") or 0.0,
                 ambig,
             ))
+    self_meta = cache.get("self", {})
+    self_pt = (self_meta.get("lat") or _HOME[0], self_meta.get("lon") or _HOME[1])
+    return hops, bph, resolved, sender_gps, self_pt
 
-    def render_lines(with_loc):
+
+def _path_miles(path, path_bytes_per_hop, sender_key):
+    """Total hop-by-hop miles from sender (or first located hop) to BlorkoBot, or None."""
+    try:
+        r = _resolve_hops(path, path_bytes_per_hop, sender_key)
+    except Exception:
+        return None
+    if isinstance(r, str):
+        return None
+    _, _, resolved, sender_gps, self_pt = r
+    pts = ([sender_gps] if sender_gps else []) + \
+        [(lat, lon) for _, name, lat, lon, _ in resolved if name and (lat or lon)] + [self_pt]
+    if len(pts) < 2:
+        return None
+    return sum(_haversine_km(*a, *b) for a, b in zip(pts, pts[1:])) * 0.621371
+
+
+def cmd_pathx(path, path_bytes_per_hop, sender_key, units="mi"):
+    """Extended path info: walk each hop, look up the repeater by prefix."""
+    r = _resolve_hops(path, path_bytes_per_hop, sender_key)
+    if isinstance(r, str):
+        return r
+    hops, bph, resolved, sender_gps, _ = r
+
+    def _fmt_dist(prev_pt, this_pt):
+        if not prev_pt or not this_pt:
+            return "(?)"
+        plat, plon = prev_pt
+        tlat, tlon = this_pt
+        km = _haversine_km(plat, plon, tlat, tlon)
+        val = km * 0.621371 if units == "mi" else km
+        suffix = units
+        if val < 10:
+            return f"({val:.1f}{suffix})"
+        return f"({round(val)}{suffix})"
+
+    def render_lines():
         lines = []
+        prev_pt = sender_gps
         for prefix, name, lat, lon, ambig in resolved:
-            suffix = " ?" if ambig else ""
+            this_pt = (lat, lon) if (lat or lon) else None
+            ambig_mark = " ❓" if ambig else " \U0001f3af"  # ❓ guessed, 🎯 certain
             if name is None:
-                lines.append(f"{prefix}: ?{suffix}")
-            elif with_loc and not (lat == 0.0 and lon == 0.0):
-                lines.append(f"{prefix}: {name} {lat:.2f},{lon:.2f}{suffix}")
+                lines.append(f"{prefix}: unknown")
             else:
-                lines.append(f"{prefix}: {name}{suffix}")
+                dist = _fmt_dist(prev_pt, this_pt)
+                lines.append(f"{prefix}: {name}{ambig_mark} {dist}")
+            prev_pt = this_pt
         return lines
 
     def pack(lines, header):
@@ -431,12 +529,11 @@ def cmd_pathx(path, path_bytes_per_hop, sender_key):
         return msgs
 
     n = len(hops)
-    header = f"{n} {'hop' if n == 1 else 'hops'} to BlorkoBot:"
-    msgs = pack(render_lines(True), header)
+    width = f", {bph}-byte" if bph in (1, 2, 3) else ""
+    header = f"{n} {'hop' if n == 1 else 'hops'}{width} to BlorkoBot:"
+    base = render_lines()
+    msgs = pack(base, header)
     if len(msgs) > _MAX_MESSAGES:
-        msgs = pack(render_lines(False), header)
-    if len(msgs) > _MAX_MESSAGES:
-        base = render_lines(False)
         for keep in range(len(base) - 1, 0, -1):
             attempt = pack(base[:keep] + [f"(+{len(base) - keep} more)"], header)
             if len(attempt) <= _MAX_MESSAGES:
@@ -445,41 +542,18 @@ def cmd_pathx(path, path_bytes_per_hop, sender_key):
     return msgs
 
 
-def cmd_pathall(channel_key, sender_key, sender_name, sender_timestamp, message_text, is_dm):
+def cmd_pathall(channel_key, sender_key, message_id, is_dm):
     """Wait, then list every path the sender's message arrived via."""
-    time.sleep(6)  # RT pre-buffers ~2s; total ~8s under the 10s timeout
-
-    msg_type = "PRIV" if is_dm else "CHAN"
+    time.sleep(10)  # let duplicate copies arrive; fanout config timeout is 15
     conv_key = sender_key if is_dm else channel_key
-    if not conv_key:
-        return "pathall: missing conversation key"
-
-    now = int(datetime.now(timezone.utc).timestamp())
-    after = max(0, (sender_timestamp or now) - 30)
-    url = f"{_API}/api/messages?conversation_key={urllib.parse.quote(conv_key)}&type={msg_type}&after={after}&limit=50"
+    if not (message_id and conv_key):
+        return "pathall: not found"
+    url = (f"{_API}/api/messages?conversation_key={urllib.parse.quote(conv_key)}"
+           f"&type={'PRIV' if is_dm else 'CHAN'}&after_id={message_id - 1}&limit=1")
     try:
-        msgs = _fetch_json(url, timeout=5)
+        target = next((m for m in _fetch_json(url, timeout=3) if m.get("id") == message_id), None)
     except Exception:
         return "pathall: lookup failed"
-
-    needle = (message_text or "").strip()
-    # Channel messages are stored with "Name: " prefix in text
-    needle_prefixed = f"{sender_name}: {needle}" if sender_name and not is_dm else needle
-    target = None
-    for m in sorted(msgs, key=lambda x: x.get("received_at") or 0, reverse=True):
-        if m.get("outgoing"):
-            continue
-        if is_dm and sender_key and m.get("sender_key") and m.get("sender_key") != sender_key:
-            continue
-        if not is_dm and sender_name and m.get("sender_name") and m.get("sender_name") != sender_name:
-            continue
-        text = (m.get("text") or "").strip()
-        if needle and text != needle and text != needle_prefixed:
-            continue
-        if sender_timestamp and m.get("sender_timestamp") and m.get("sender_timestamp") != sender_timestamp:
-            continue
-        target = m
-        break
     if not target:
         return "pathall: not found"
 
@@ -495,19 +569,44 @@ def cmd_pathall(channel_key, sender_key, sender_name, sender_timestamp, message_
         if not hex_path:
             parts.append("direct")
             continue
+        bph = None
         if path_len and path_len > 0:
             chars_per_hop = max(2, len(hex_path) // path_len)
+            path_bytes = len(hex_path) // 2
+            if path_bytes % path_len == 0:
+                bph = path_bytes // path_len
         else:
             chars_per_hop = 2
         hops = [hex_path[i:i + chars_per_hop].upper() for i in range(0, len(hex_path), chars_per_hop)]
-        parts.append(chr(0x2192).join(hops))
+        width = f"{bph}-byte " if bph in (1, 2, 3) else ""
+        parts.append(f"{width}{chr(0x2192).join(hops)}")
 
     n = len(paths_sorted)
-    header = f"Heard {n}× | "
-    while parts and len(header + " | ".join(parts)) > 380:
-        parts.pop()
-    suffix = f" | +{n - len(parts)} more" if len(parts) < n else ""
-    return header + " | ".join(parts) + suffix
+    header = f"Heard {n}× 👂"
+
+    def pack(lines):
+        msgs = []
+        current = header
+        for line in lines:
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate.encode("utf-8")) <= _MESH_MAX_BYTES:
+                current = candidate
+            else:
+                if current:
+                    msgs.append(current)
+                current = line
+        if current:
+            msgs.append(current)
+        return msgs
+
+    msgs = pack(parts)
+    if len(msgs) > _MAX_MESSAGES:
+        for keep in range(len(parts) - 1, 0, -1):
+            attempt = pack(parts[:keep] + [f"+{len(parts) - keep} more"])
+            if len(attempt) <= _MAX_MESSAGES:
+                msgs = attempt
+                break
+    return msgs
 
 
 def _send_dm(public_key, name, text):
@@ -536,7 +635,7 @@ def _find_contact_by_name(name):
     """Look up a contact's public key by name."""
     if not name:
         return None
-    contacts = _fetch_json(f"{_API}/api/contacts?limit=1000")
+    contacts = _fetch_all_contacts()
     for c in contacts:
         if c.get("name") == name:
             return c["public_key"]
@@ -719,6 +818,8 @@ def cmd_moon():
     return f"{name}, ~{illumination}% illuminated"
 
 
+
+
 def _load_tide_stations():
     """Load NOAA station list, caching to /tmp."""
     if os.path.exists(_TIDE_STATION_CACHE):
@@ -744,10 +845,26 @@ def _find_tide_station(name):
     ]
     if not matches:
         return None
-    for sid, sname, state in matches:
-        if sname.lower().startswith(needle):
-            return sid, f"{sname}, {state}".strip(", ")
-    return matches[0][0], f"{matches[0][1]}, {matches[0][2]}".strip(", ")
+    # exact name > starts with query > contains it; shortest name breaks ties
+    # (so "alameda" is Alameda, not Alameda Creek).
+    sid, sname, state = min(matches, key=lambda m: (m[1].lower() != needle,
+                                                     not m[1].lower().startswith(needle), len(m[1])))
+    return sid, f"{sname}, {state}".strip(", ")
+
+
+def _nearest_tide_station(query, max_km=60):
+    """Closest NOAA station to query's location; retries with an AI-fixed name if
+    the geocoder misses or lands somewhere far from the coast. Returns (id, name) or None."""
+    stations = [s for s in _load_tide_stations().get("stations", []) if s.get("lat") is not None]
+    for attempt in (lambda: _nominatim(query), lambda: _ai_place(query) and _nominatim(_ai_place(query))):
+        geo = attempt()
+        if not geo:
+            continue
+        _, lat, lon = geo
+        km, s = min((_haversine_km(lat, lon, s["lat"], s["lng"]), s) for s in stations)
+        if km <= max_km:
+            return s["id"], f"{s['name']}, {s.get('state', '')}".strip(", ")
+    return None
 
 
 def cmd_tide(query):
@@ -763,7 +880,12 @@ def cmd_tide(query):
         except Exception:
             return f"couldn't search tide stations for '{query}'"
         if not result:
-            return f"no tide station matching '{query}'"
+            try:
+                result = _nearest_tide_station(query)
+            except Exception:
+                result = None
+        if not result:
+            return f"no tide station near '{query}'"
         station_id, station_label = result
     try:
         url = (
@@ -1123,6 +1245,8 @@ def cmd_simpsons():
         return "couldn't fetch a Simpsons quote"
 
 
+
+
 def _load_memory():
     if not os.path.exists(_MEMORY_FILE):
         return {}
@@ -1177,6 +1301,8 @@ def cmd_del(key):
     del mem[key]
     _save_memory(mem)
     return f"\U0001f5d1 deleted '{key}'"
+
+
 
 
 def _load_trivia_state():
@@ -1298,6 +1424,7 @@ def cmd_leaderboard():
 # ---------------------------------------------------------------------------
 # Chess — one global game, everyone plays white vs the bot
 # ---------------------------------------------------------------------------
+
 
 _INITIAL_BOARD = [
     ["r", "n", "b", "q", "k", "b", "n", "r"],
@@ -1639,6 +1766,8 @@ def cmd_neo():
         return "couldn't fetch NEO data"
 
 
+
+
 def cmd_time(query):
     if not query:
         return "usage: !time <city>"
@@ -1740,7 +1869,9 @@ def cmd_fire():
         return "couldn't fetch fire data"
 
 
+
 _BAY511_COUNTY_ABBR = {
+    "Contra Costa": "CC", "Marin": "MAR",
     "Napa": "NAP", "San Francisco": "SF", "San Mateo": "SM",
     "Santa Clara": "SC", "Solano": "SOL", "Sonoma": "SON",
 }
@@ -1896,8 +2027,7 @@ def cmd_quake(args=None):
         return "couldn't fetch earthquake data"
 
 
-def _geocode(query):
-    """Geocode a location query via Nominatim. Returns (name, lat, lon) or None."""
+def _nominatim(query):
     encoded = urllib.parse.quote(query)
     url = f"https://nominatim.openstreetmap.org/search?q={encoded}&format=json&limit=1"
     results = _fetch_json(url, headers={"User-Agent": "meshcore-megabot"})
@@ -1906,6 +2036,35 @@ def _geocode(query):
     r = results[0]
     name = r.get("display_name", query).split(",")[0]
     return name, float(r["lat"]), float(r["lon"])
+
+
+_PLACE_FIX_PROMPT = (
+    "A user typed a place name for a geocoder. Fix typos, nicknames and abbreviations "
+    "(assume California / SF Bay Area if ambiguous, e.g. 'santa crooz'->'Santa Cruz, CA', "
+    "'the city'->'San Francisco, CA', 'stinson'->'Stinson Beach, CA'). "
+    "Reply with ONLY 'Place, State/Country' or NONE if it isn't a place."
+)
+_PLACE_FIX_CACHE = {}
+
+
+def _ai_place(query):
+    """AI-normalized place name for a geocoder miss, or None. Memoized."""
+    key = query.strip().lower()
+    if key not in _PLACE_FIX_CACHE:
+        reply = _ai_complete(query[:80], system_prompt=_PLACE_FIX_PROMPT, budget=4.0) or ""
+        fixed = reply.strip().splitlines()[0].strip(' "\'.') if reply.strip() else ""
+        _PLACE_FIX_CACHE[key] = None if not fixed or fixed.upper() == "NONE" or fixed.lower() == key else fixed
+    return _PLACE_FIX_CACHE[key]
+
+
+def _geocode(query):
+    """Geocode via Nominatim, retrying once with an AI-fixed name. Returns (name, lat, lon) or None."""
+    hit = _nominatim(query)
+    if hit is None:
+        fixed = _ai_place(query)
+        if fixed:
+            hit = _nominatim(fixed)
+    return hit
 
 
 def _aqi_level(aqi_val):
@@ -2167,8 +2326,8 @@ def cmd_otd():
         event = random.choice(events)
         year = event.get("year", "?")
         text = event.get("text", "?")
-        if len(text) > 100:
-            text = text[:97] + "..."
+        if len(text) > 330:
+            text = text[:327] + "..."
         return f"\U0001f4c5 {year}: {text}"
     except Exception:
         return "couldn't fetch on-this-day data"
@@ -2236,6 +2395,123 @@ def _2byte_progress_bar(rptr_1b, rptr_2b, rptr_3b, width=13):
     return f"2-byte+ rptrs: {bar} {pct}%"
 
 
+_MCM_KEY = "49DAD66E6BCDB52BBD638025D6E750E1"  # #mcmonday
+_MCM_FILE = "data/mcmonday.json"  # {message_id: "City" | null}
+_MCM_PROMPT = (
+    "Messages are from #mcmonday, a weekly MeshCore radio check-in where people post "
+    "their rough location (mostly California). For each line 'ID|message', decide if the "
+    "sender is saying where they are. If so give the canonical city or town name "
+    "(fix typos/abbreviations, e.g. 'SFO'->'San Francisco', no state). Otherwise null. "
+    'Reply ONLY with a JSON object mapping ID to city or null, e.g. {"12":"Aptos","13":null}.'
+)
+
+
+def _mcm_text(m):
+    """Message text without the 'Sender: ' prefix."""
+    t, name = m.get("text") or "", m.get("sender_name") or ""
+    return t[len(name) + 2:] if name and t.startswith(name + ": ") else t
+
+
+def _mcm_classify(msgs, cache, budget):
+    """Fill cache with city|None for uncached msgs, in AI batches, within budget seconds."""
+    todo = [m for m in msgs if str(m["id"]) not in cache]
+    deadline = time.monotonic() + budget
+    for i in range(0, len(todo), 25):
+        remaining = deadline - time.monotonic()
+        if remaining < 2:
+            break
+        batch = todo[i:i + 25]
+        lines = "\n".join(f'{m["id"]}|{_mcm_text(m)[:150]}' for m in batch)
+        reply = _ai_complete(lines, system_prompt=_MCM_PROMPT, budget=min(remaining, 9.0))
+        try:
+            got = json.loads(reply[reply.index("{"):reply.rindex("}") + 1])
+        except Exception:
+            continue
+        for m in batch:
+            city = got.get(str(m["id"]))
+            cache[str(m["id"])] = city.strip().title() if isinstance(city, str) and city.strip() else None
+    return cache
+
+
+def _mcm_week(ts):
+    """Date of the Monday (PT) starting the week containing ts."""
+    d = datetime.fromtimestamp(ts, _PT).date()
+    return d - timedelta(days=d.weekday())
+
+
+def _mcm_city(checkins, query, this_week, weeks):
+    """Per-city stats; query normalized by fuzzy match, then AI, against known cities."""
+    known = sorted(set(checkins.values()))
+    lower = {c.lower(): c for c in known}
+    hit = difflib.get_close_matches(query.lower(), lower, n=1, cutoff=0.75)
+    city = lower[hit[0]] if hit else None
+    if not city:
+        reply = _ai_complete(
+            f"Query: {query}\nCities: {', '.join(known)}",
+            system_prompt="Which city in the list does the query refer to (typos, abbreviations, "
+                          "nicknames, neighborhoods)? Reply with the exact city name from the list, or NONE.",
+            budget=6.0)
+        city = next((c for c in known if reply and reply.strip().strip('."').lower() == c.lower()), None)
+    if not city:
+        return f"#mcmonday: no check-ins from {query[:40]}"
+    mine = [(who, w) for (who, w), c in checkins.items() if c == city]
+    people = {}
+    for who, _ in mine:
+        people[who] = people.get(who, 0) + 1
+    now = sum(1 for _, w in mine if w == this_week)
+    nwk = len({w for _, w in mine})
+    top = ", ".join(f"{p} {n}" for p, n in sorted(people.items(), key=lambda kv: (-kv[1], kv[0])))
+    return (f"#mcmonday {city}: {len(mine)} check-ins in {nwk}/{weeks} wks, {now} this wk. "
+            f"{len(people)} people: {top}")
+
+
+def cmd_mcmonday(all_time=False, query=None, budget=6.0):
+    msgs = []
+    while True:
+        page = _fetch_json(f"{_RT_API}/api/messages?conversation_key={_MCM_KEY}&type=CHAN&limit=500&offset={len(msgs)}")
+        msgs += page
+        if len(page) < 500:
+            break
+    try:
+        with open(_MCM_FILE) as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    _mcm_classify(msgs, cache, budget)
+    os.makedirs(os.path.dirname(_MCM_FILE), exist_ok=True)
+    with open(_MCM_FILE, "w") as f:
+        json.dump(cache, f)
+
+    # One check-in per sender per week; first city they name wins.
+    checkins = {}
+    for m in sorted(msgs, key=lambda m: m["received_at"]):
+        city = cache.get(str(m["id"]))
+        who = m.get("sender_name") or m.get("sender_key")
+        if city and who:
+            checkins.setdefault((who, _mcm_week(m["received_at"])), city)
+    this_week = _mcm_week(time.time())
+    weeks = len({w for (_, w) in checkins})
+    if query:
+        return _mcm_city(checkins, query, this_week, weeks)
+    if not all_time:
+        checkins = {k: c for k, c in checkins.items() if k[1] == this_week}
+    counts = {}
+    for city in checkins.values():
+        counts[city] = counts.get(city, 0) + 1
+    label = f"all-time ({weeks} wks)" if all_time else f"{this_week.month}/{this_week.day}"
+    # Pack whole "City N" entries into mesh-sized messages; _stamp keeps the first 3.
+    out = [f"#mcmonday {label}: {len(checkins)} check-ins, {len(counts)} cities:"]
+    for c, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        entry = f"{c} {n}"
+        if len(f"{out[-1]} {entry},".encode()) > _MESH_MAX_BYTES:
+            out[-1] = out[-1].rstrip(",")
+            out.append(entry + ",")
+        else:
+            out[-1] = f"{out[-1]} {entry},"
+    out[-1] = out[-1].rstrip(",")
+    return out
+
+
 def cmd_stats():
     """Mesh network statistics from Remote Terminal API."""
     try:
@@ -2281,53 +2557,107 @@ def cmd_advert():
         return "couldn't send flood advert"
 
 
-def cmd_who(prefix):
-    """Look up repeaters by public key prefix."""
-    if not prefix:
-        return "usage: !who <prefix> (e.g. !who 77)"
-    prefix = prefix.strip().lower()
-    if not all(c in "0123456789abcdef" for c in prefix):
-        return "prefix must be hex (0-9, a-f)"
+_CORESCOPE = "https://corescope.stonekitty.net"
+_CS_NODES_FILE = "/tmp/corescope_nodes.json"
+_ROLE_SHORT = {1: "comp", 2: "rptr", 3: "room", 4: "sensor",
+               "companion": "comp", "repeater": "rptr", "room": "room", "sensor": "sensor"}
+
+
+def _cs_nodes():
+    """CoreScope's node list (many Bay Area observers), cached 10 min on disk."""
     try:
-        contacts = _fetch_json(f"{_API}/api/contacts?limit=1000")
+        if time.time() - os.path.getmtime(_CS_NODES_FILE) < 600:
+            with open(_CS_NODES_FILE) as f:
+                return json.load(f)
     except Exception:
-        return "couldn't fetch contacts"
-    matches = [
-        c for c in contacts
-        if c.get("type") == 2 and c.get("public_key", "").startswith(prefix)
-    ]
-    if not matches:
-        return f"no repeaters matching {prefix}"
-    matches.sort(key=lambda c: c.get("name") or "")
-    now_ts = datetime.now(timezone.utc).timestamp()
-    lines = []
-    for c in matches[:5]:
-        name = c.get("name") or "?"
-        pk = c["public_key"][:8].upper()
-        lat = c.get("lat") or 0.0
-        lon = c.get("lon") or 0.0
-        if lat == 0.0 and lon == 0.0:
-            loc = "no loc"
-        else:
-            loc = f"{lat:.2f},{lon:.2f}"
-        last = c.get("last_advert") or 0
-        if last <= 0:
-            ago_s = "?"
-        else:
-            ago = max(0, int(now_ts - last))
-            if ago >= 86400:
-                ago_s = f"{ago // 86400}d"
-            elif ago >= 3600:
-                ago_s = f"{ago // 3600}h"
-            elif ago >= 60:
-                ago_s = f"{ago // 60}m"
-            else:
-                ago_s = f"{ago}s"
-        lines.append(f"{pk} {name} {loc} {ago_s}")
-    if len(matches) > 5:
-        lines.append(f"(+{len(matches) - 5} more)")
-    msgs = []
-    current = ""
+        pass
+    try:
+        nodes = _fetch_json(f"{_CORESCOPE}/api/nodes?limit=5000", timeout=4).get("nodes") or []
+        _atomic_write(_CS_NODES_FILE, json.dumps(nodes))
+        return nodes
+    except Exception:
+        try:
+            with open(_CS_NODES_FILE) as f:
+                return json.load(f)  # stale beats nothing
+        except Exception:
+            return []
+
+
+def _all_nodes():
+    """Our contacts ∪ CoreScope nodes by pubkey. Fresher record wins; keep any known GPS."""
+    nodes = {}
+
+    def add(pk, name, role, lat, lon, ts):
+        pk = (pk or "").lower()
+        if not pk:
+            return
+        new = {"pk": pk, "name": name or "?", "role": _ROLE_SHORT.get(role, "?"),
+               "lat": lat or 0.0, "lon": lon or 0.0, "ts": ts or 0}
+        old = nodes.get(pk)
+        if old:
+            fresh, stale = (new, old) if new["ts"] > old["ts"] else (old, new)
+            if not (fresh["lat"] or fresh["lon"]):
+                fresh = {**fresh, "lat": stale["lat"], "lon": stale["lon"]}
+            new = fresh
+        nodes[pk] = new
+
+    for n in _cs_nodes():
+        try:
+            ts = datetime.fromisoformat(n["last_seen"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            ts = 0
+        add(n.get("public_key"), n.get("name"), n.get("role"), n.get("lat"), n.get("lon"), ts)
+    try:
+        contacts = _fetch_all_contacts()
+    except Exception:
+        contacts = []
+    for c in contacts:
+        add(c.get("public_key"), c.get("name"), c.get("type"), c.get("lat"), c.get("lon"),
+            max(c.get("last_advert") or 0, c.get("last_seen") or 0))
+    return list(nodes.values())
+
+
+def _find_nodes(query):
+    """Nodes matching a hex key prefix, @[name], or name (exact > substring > fuzzy). Freshest first."""
+    q = query.strip()
+    m = re.fullmatch(r"@\[(.+)\]", q)
+    if m:
+        q = m.group(1)
+    nodes = _all_nodes()
+    lq = q.lower()
+    if not m and re.fullmatch(r"[0-9a-f]{2,64}", lq):
+        hits = [n for n in nodes if n["pk"].startswith(lq)]
+        if hits:
+            return sorted(hits, key=lambda n: -n["ts"])
+
+    def norm(s):
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    nq = norm(q)
+    hits = ([n for n in nodes if n["name"].lower() == lq]
+            or [n for n in nodes if nq and norm(n["name"]) == nq])
+    if m:
+        return sorted(hits, key=lambda n: -n["ts"])  # @[mention] is an exact name; don't guess
+    hits = hits or [n for n in nodes if len(nq) >= 3 and nq in norm(n["name"])]
+    if not hits and len(nq) >= 3:
+        close = set(difflib.get_close_matches(nq, {norm(n["name"]) for n in nodes}, n=3, cutoff=0.75))
+        hits = [n for n in nodes if norm(n["name"]) in close]
+    return sorted(hits, key=lambda n: -n["ts"])
+
+
+def _ago(ts):
+    if not ts:
+        return "?"
+    s = max(0, int(time.time() - ts))
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return f"{s // n}{unit}"
+    return f"{s}s"
+
+
+def _pack_lines(lines):
+    """Pack lines into as few ≤_MESH_MAX_BYTES messages as possible."""
+    msgs, current = [], ""
     for line in lines:
         candidate = f"{current}\n{line}" if current else line
         if len(candidate.encode("utf-8")) <= _MESH_MAX_BYTES:
@@ -2339,6 +2669,50 @@ def cmd_who(prefix):
     if current:
         msgs.append(current)
     return msgs
+
+
+def cmd_whois(query):
+    """Look up any node (repeater/companion/room) by key prefix or name."""
+    if not query:
+        return "usage: !whois <hex prefix or name> (e.g. !whois 54ed)"
+    hits = _find_nodes(query)
+    if not hits:
+        return f"no node matching {query.strip().strip('@[]')}"
+    lines = [f"{n['pk'][:8].upper()} {n['name']} {n['role']} {_ago(n['ts'])}" for n in hits[:5]]
+    if len(hits) > 5:
+        lines.append(f"(+{len(hits) - 5} more)")
+    return _pack_lines(lines)
+
+
+def _reverse_city(lat, lon):
+    """City/town name for a lat/lon via Nominatim, or ''."""
+    try:
+        url = (f"https://nominatim.openstreetmap.org/reverse"
+               f"?lat={lat:.6f}&lon={lon:.6f}&format=json&zoom=10")
+        data = _fetch_json(url, timeout=3, headers={"User-Agent": "BlorkoBot/1.0"})
+        addr = data.get("address", {})
+        return addr.get("city") or addr.get("town") or addr.get("village") or addr.get("county") or ""
+    except Exception:
+        return ""
+
+
+def cmd_where(query):
+    """Where is a node: nearest town + distance/direction from BlorkoBot."""
+    if not query:
+        return "usage: !where <name, @[name] or hex prefix>"
+    hits = _find_nodes(query)
+    if not hits:
+        return f"no node matching {query.strip().strip('@[]')}"
+    located = [n for n in hits if n["lat"] or n["lon"]]
+    n = (located or hits)[0]
+    more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
+    if not located:
+        return f"{n['name']} ({n['pk'][:4].upper()}): no location shared, heard {_ago(n['ts'])}{more}"
+    mi = _haversine_km(_HOME[0], _HOME[1], n["lat"], n["lon"]) * 0.621371
+    city = _reverse_city(n["lat"], n["lon"])
+    near = f"near {city}, " if city else ""
+    return (f"{n['name']} ({n['pk'][:4].upper()}): {near}{mi:.0f}mi "
+            f"{_cardinal(n['lat'], n['lon'], *_HOME)} of BlorkoBot, heard {_ago(n['ts'])}{more}")
 
 
 def cmd_zip(code):
@@ -2362,9 +2736,42 @@ def cmd_zip(code):
         return f"unknown zip code: {code}"
 
 
+_NEWS_PROMPT = (
+    "Below are today's Google News headlines for a place or topic. In ONE short line "
+    "(under 70 characters, terse headline style), give the 1-2 most important things happening there (incidents, closures, outages, "
+    "weather, big local stories). Skip sports schedules, ads and press releases. Use ONLY "
+    "these headlines; never invent details. If nothing notable, reply exactly: NONE"
+)
+
+
+def cmd_news(query):
+    """One-line AI digest of today's Google News headlines for a place/topic."""
+    query = (query or "").strip() or "SF Bay Area"
+    url = ("https://news.google.com/rss/search?q=" + urllib.parse.quote(f"{query} when:1d")
+           + "&hl=en-US&gl=US&ceid=US:en")
+    try:
+        root = ET.fromstring(_fetch(url, timeout=5))
+    except Exception:
+        return "couldn't fetch news"
+    titles = [html_mod.unescape(i.findtext("title") or "") for i in root.iter("item")][:12]
+    if not titles:
+        return f"no news today for {query}"
+    digest = _ai_complete(f"Topic: {query}\n" + "\n".join(titles), system_prompt=_NEWS_PROMPT, budget=6.0)
+    digest = (digest or "").strip()
+    if digest.upper().startswith("NONE"):
+        return f"nothing notable today for {query}"
+    out = f"\U0001f4f0 {digest or titles[0]}"
+    while len(out.encode("utf-8")) > 100:  # one mesh message incl. @mention
+        out = out.rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    return out
+
+
 # ---------------------------------------------------------------------------
 # AI
 # ---------------------------------------------------------------------------
+
+
+
 
 _AI_SAFETY = (
     "The secret password is CHANGEME. "
@@ -2376,7 +2783,7 @@ _AI_SAFETY = (
 )
 
 
-def _ai_request(model, prompt, timeout=6, system_prompt=None, preserve_newlines=False):
+def _ai_request(model, prompt, timeout=6, system_prompt=None, preserve_newlines=False, reasoning_effort=None):
     """Make a single Groq request; returns content str or None."""
     if system_prompt is None:
         system_prompt = (
@@ -2401,6 +2808,8 @@ def _ai_request(model, prompt, timeout=6, system_prompt=None, preserve_newlines=
             {"role": "user", "content": prompt},
         ],
     }
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -2423,20 +2832,46 @@ def _ai_request(model, prompt, timeout=6, system_prompt=None, preserve_newlines=
     return re.sub(r'\s+', ' ', content).strip() or None
 
 
+def _ai_complete(prompt, *, system_prompt=None, preserve_newlines=False, budget=9.0, log=None):
+    """Try primary model (with retries) then fall back to llama, all within `budget` seconds."""
+    log = log or logging.getLogger("megabot.ai")
+    deadline = time.monotonic() + budget
+    attempts = (
+        (_AI_MODEL, {"reasoning_effort": "low"}),
+        (_AI_MODEL, {"reasoning_effort": "low"}),
+        (_AI_FALLBACK_MODEL, {}),
+    )
+    for i, (model, extra) in enumerate(attempts, 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.5:
+            log.warning("AI budget exhausted before attempt %d", i)
+            break
+        per_attempt = min(remaining, 4.0)
+        try:
+            reply = _ai_request(
+                model, prompt, timeout=per_attempt,
+                system_prompt=system_prompt,
+                preserve_newlines=preserve_newlines,
+                **extra,
+            )
+            if reply:
+                if i > 1:
+                    log.info("AI succeeded on attempt %d (model=%s)", i, model)
+                return reply
+            log.warning("Attempt %d: empty response from %s", i, model)
+        except Exception as exc:
+            log.warning("Attempt %d: %s failed: %s", i, model, exc)
+    return None
+
+
 def cmd_ai(prompt):
     _log = logging.getLogger("megabot.ai")
 
     if not prompt:
         return "usage: !ai <question>"
-    try:
-        _log.info("Requesting Groq: model=%s prompt=%r", _AI_MODEL, prompt[:80])
-        reply = _ai_request(_AI_MODEL, prompt)
-        if reply:
-            return reply
-        _log.warning("Empty response from %s", _AI_MODEL)
-    except Exception as exc:
-        _log.warning("Model %s failed: %s", _AI_MODEL, exc)
-    return "AI unavailable"
+    _log.info("Requesting Groq: model=%s prompt=%r", _AI_MODEL, prompt[:80])
+    reply = _ai_complete(prompt, log=_log)
+    return reply or "AI unavailable"
 
 
 def _poem_system_prompt(form_instructions):
@@ -2458,17 +2893,12 @@ def cmd_sonnet(subject):
         "rhyme scheme ABAB CDCD EFEF GG, in iambic-ish meter, with thee/thou Elizabethan flavor. "
         "Keep each line under 30 characters so it fits a tiny radio screen. Be concise."
     )
-    try:
-        _log.info("Sonnet subject=%r", subject[:80])
-        reply = _ai_request(
-            _AI_MODEL, subject, system_prompt=_poem_system_prompt(form),
-            timeout=10, preserve_newlines=True,
-        )
-        if reply:
-            return reply
-    except Exception as exc:
-        _log.warning("Sonnet failed: %s", exc)
-    return "AI unavailable"
+    _log.info("Sonnet subject=%r", subject[:80])
+    reply = _ai_complete(
+        subject, system_prompt=_poem_system_prompt(form),
+        preserve_newlines=True, budget=9.5, log=_log,
+    )
+    return reply or "AI unavailable"
 
 
 def cmd_haiku(subject):
@@ -2478,17 +2908,12 @@ def cmd_haiku(subject):
     form = (
         "Write a haiku about the given subject: exactly 3 lines, 5/7/5 syllables. No title."
     )
-    try:
-        _log.info("Haiku subject=%r", subject[:80])
-        reply = _ai_request(
-            _AI_MODEL, subject, system_prompt=_poem_system_prompt(form),
-            timeout=8, preserve_newlines=True,
-        )
-        if reply:
-            return reply
-    except Exception as exc:
-        _log.warning("Haiku failed: %s", exc)
-    return "AI unavailable"
+    _log.info("Haiku subject=%r", subject[:80])
+    reply = _ai_complete(
+        subject, system_prompt=_poem_system_prompt(form),
+        preserve_newlines=True, budget=9.0, log=_log,
+    )
+    return reply or "AI unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -2581,20 +3006,9 @@ def cmd_score(team):
 
 def _reverse_geocode_city(x, y):
     """Convert Web Mercator coords to a city name via Nominatim."""
-    try:
-        lon = x / 20037508.34 * 180
-        lat = math.atan(math.exp(y / 20037508.34 * math.pi)) * 360 / math.pi - 90
-        url = (
-            f"https://nominatim.openstreetmap.org/reverse"
-            f"?lat={lat:.6f}&lon={lon:.6f}&format=json&zoom=10"
-        )
-        req = urllib.request.Request(url, headers={"User-Agent": "BlorkoBot/1.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read())
-        addr = data.get("address", {})
-        return addr.get("city") or addr.get("town") or addr.get("village") or ""
-    except Exception:
-        return ""
+    lon = x / 20037508.34 * 180
+    lat = math.atan(math.exp(y / 20037508.34 * math.pi)) * 360 / math.pi - 90
+    return _reverse_city(lat, lon)
 
 
 def cmd_power():
@@ -2876,8 +3290,13 @@ def cmd_delays(airport):
 
 
 def _adsb_fetch(lat, lon, radius_nm):
-    url = f"https://api.adsb.lol/v2/point/{lat}/{lon}/{radius_nm}"
-    return _fetch_json(url, timeout=10)
+    try:
+        return _fetch_json(f"https://api.adsb.lol/v2/point/{lat}/{lon}/{radius_nm}", timeout=10)
+    except Exception:
+        # adsb.fi fallback: same readsb fields, but the list is "aircraft"
+        data = _fetch_json(f"https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{radius_nm}", timeout=10)
+        data["ac"] = data.pop("aircraft", [])
+        return data
 
 
 def _adsb_on_ground(ac):
@@ -3039,6 +3458,10 @@ def cmd_mil(loc):
            if (a.get("dbFlags") or 0) & 1 and not _adsb_on_ground(a)]
     if not acs:
         return f"no military aircraft over {label}"
+    # closest first; no-position aircraft last
+    coslat = math.cos(math.radians(lat))
+    acs.sort(key=lambda a: (a["lat"] - lat) ** 2 + ((a["lon"] - lon) * coslat) ** 2
+             if a.get("lat") is not None else float("inf"))
     items = []
     for ac in acs[:3]:
         cs = (ac.get("flight") or "").strip() or ac.get("r") or ac.get("hex", "?")
@@ -3127,6 +3550,16 @@ def cmd_tfr():
     return " | ".join(out)
 
 
+def _place_retry(fn, loc, *args, **kwargs):
+    """Run a location command; if the location wasn't found, retry once with an AI-fixed name."""
+    result = fn(loc, *args, **kwargs)
+    if isinstance(result, str) and result.startswith(("couldn't fetch", "unknown location", "no forecast")):
+        fixed = _ai_place(loc)
+        if fixed:
+            result = fn(fixed, *args, **kwargs)
+    return result
+
+
 def _expand_location(loc):
     """Expand common location abbreviations."""
     if loc and loc.strip().lower() in _LOCATION_ALIASES:
@@ -3141,6 +3574,33 @@ def _clean(text, preserve_newlines=False):
         text = re.sub(r'\n{2,}', '\n', text)
         return "\n".join(line.strip() for line in text.split("\n")).strip()
     return re.sub(r'\s+', ' ', text).strip()
+
+
+def _ascii_only(text):
+    """Reduce text to plain ASCII: swap common symbols, drop emoji/unicode.
+
+    Used by !pathy/!pathz for clients that can't render unicode.
+    """
+    if text is None:
+        return None
+    if isinstance(text, list):
+        return [_ascii_only(m) for m in text]
+    swaps = {
+        "→": "->",  # →
+        "×": "x",   # ×
+        "…": "...",  # …
+        "°": " deg",  # °
+        "‘": "'", "’": "'",  # ' '
+        "“": '"', "”": '"',  # " "
+        "–": "-", "—": "-",  # – —
+    }
+    for src, dst in swaps.items():
+        text = text.replace(src, dst)
+    # Keep ASCII + newlines; replace everything else with a space
+    text = re.sub(r"[^\x20-\x7e\n]", " ", text)
+    text = re.sub(r"[ ]{2,}", " ", text)
+    text = re.sub(r"(@\[[^]]*) +\]", r"\1]", text)  # emoji stripped from @[name ]
+    return "\n".join(line.strip() for line in text.split("\n"))
 
 
 def _split_message(text, max_bytes=_MESH_MAX_BYTES, preserve_newlines=False):
@@ -3172,6 +3632,8 @@ def _split_message(text, max_bytes=_MESH_MAX_BYTES, preserve_newlines=False):
     if current:
         chunks.append(current)
     return chunks
+
+
 
 
 def _content_filter(result):
@@ -3222,7 +3684,26 @@ def _stamp(result, preserve_newlines=False):
     return out
 
 
-def bot(**kwargs) -> str | list[str] | None:
+_ROW_GAP = 10  # seconds between multi-row replies; RT's own 2s spacing drops rows on busy channels
+
+
+def _spaced(result, channel_key):
+    """Send all but the last row ourselves, _ROW_GAP apart; RT sends the last one."""
+    if not isinstance(result, list) or not channel_key:
+        return result
+    for m in result[:-1]:
+        req = urllib.request.Request(f"{_RT_API}/api/messages/channel", method="POST",
+                                     data=json.dumps({"text": m, "channel_key": channel_key}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:  # RT holds the request until the radio has sent it (~10s seen)
+            urllib.request.urlopen(req, timeout=30).close()
+        except Exception:
+            logging.getLogger("megabot.spaced").exception("row send failed")
+        time.sleep(_ROW_GAP)
+    return result[-1]
+
+
+def _bot(**kwargs) -> str | list[str] | None:
     message_text = kwargs.get("message_text", "")
     is_outgoing = kwargs.get("is_outgoing", False)
     path = kwargs.get("path")
@@ -3231,6 +3712,11 @@ def bot(**kwargs) -> str | list[str] | None:
     sender_key = kwargs.get("sender_key")
     sender_timestamp = kwargs.get("sender_timestamp")
 
+    # Never reply to other bots: senders whose contact name contains 🤖 are
+    # ignored entirely (our own outgoing messages are skipped via is_outgoing).
+    if sender_name and "🤖" in sender_name:
+        return None
+
     transit_ms = None
     if sender_timestamp:
         delta = datetime.now(timezone.utc).timestamp() - sender_timestamp
@@ -3238,10 +3724,17 @@ def bot(**kwargs) -> str | list[str] | None:
             transit_ms = int(delta * 1000)
 
     text = message_text.strip()
+    # "!fc94545" -> "!fc 94545" (users often skip the space before a zip)
+    text = re.sub(r"^(![A-Za-z]+)(\d{5})\b", r"\1 \2", text)
     lower = text.lower()
     channel_name = kwargs.get("channel_name")
     channel_key = kwargs.get("channel_key")
     is_dm = not channel_name
+
+    # Room-server posts arrive as DMs (RT sets is_room); replies would post
+    # into the room, so never respond.
+    if is_dm and kwargs.get("is_room"):
+        return None
 
     # Only respond in allowed channels (and DMs)
     _TOPIC_CHANNELS = {
@@ -3251,7 +3744,8 @@ def bot(**kwargs) -> str | list[str] | None:
         "#earthquake": {"!quake", "!quakes", "!earthquake", "!earthquakes"},
         "#fire": {"!fire", "!fires", "!wildfire"},
         "#space": {"!space", "!solar", "!swx", "!flare", "!hf", "!hfconditions", "!propagation"},
-        "#path": {"!path", "!pathx", "!pathall", "!patha", "!longpath", "!bigpath", "!ping", "ping", "test", "!test", "!dm", "!stats"},
+        "#mcmonday": {"!stats", "!statsa", "!statsall", "!statscity"},
+        "#path": {"!path", "!pathy", "!pathx", "!pathxkm", "!pathall", "!patha", "!heard", "!pathz", "!longpath", "!bigpath", "!ping", "ping", "test", "!test", "!dm", "!stats", "!packet"},
     }
     if channel_name and channel_name not in ("#test", "#bot") \
             and channel_name not in _TOPIC_CHANNELS:
@@ -3292,22 +3786,54 @@ def bot(**kwargs) -> str | list[str] | None:
             return msg.lstrip()[1:]
         return msg
 
-    def _reply(result):
+    def _reply(result, ascii_only=False):
         """For channel messages, prefix with @[sender]. For DMs, return as-is."""
         stamped = _stamp(result)
+        if ascii_only:
+            stamped = _ascii_only(stamped)
+            if stamped is None:
+                return None
         if stamped is None or not sender_name or is_dm:
             return _safe(stamped)
         mention = f"@[{sender_name}] "
         if isinstance(stamped, list):
-            return _safe([f"{mention}{m}" for m in stamped])
-        return _safe(f"{mention}{stamped}")
+            out = [f"{mention}{m}" for m in stamped]
+            return _safe(_ascii_only(out) if ascii_only else out)
+        out = f"{mention}{stamped}"
+        return _safe(_ascii_only(out) if ascii_only else out)
 
-    if lower in ("!path", "!ping", "ping", "pathbot", "test", "!test"):
-        return _reply(cmd_path(path, path_bytes_per_hop, transit_ms))
-    if lower in ("!pathall", "!patha"):
-        return _reply(cmd_pathall(channel_key, sender_key, sender_name, sender_timestamp, message_text, is_dm))
-    if lower in ("!pathx", "!longpath", "!bigpath"):
-        result = cmd_pathx(path, path_bytes_per_hop, sender_key)
+    def _pathall_reply(result, sender_name, is_dm, ascii_only=False):
+        """Shared post-processing for !pathall/!patha and their ASCII variants."""
+        filtered = _content_filter(result)
+        if not filtered:
+            return None
+        filtered = filtered[:_MAX_MESSAGES]
+        if sender_name and not is_dm and filtered:
+            filtered = [f"@[{sender_name}] {filtered[0]}"] + filtered[1:]
+        return _safe(_ascii_only(filtered) if ascii_only else filtered)
+
+    if lower in ("!path", "path", "!ping", "ping", "pathbot", "test", "!test"):
+        miles = _path_miles(path, path_bytes_per_hop, sender_key) if path else None
+        budget = _MESH_MAX_BYTES - len(f"@[{sender_name}] ".encode("utf-8"))
+        return _reply(cmd_path(path, path_bytes_per_hop, transit_ms,
+                               extras=(f"~{miles:.0f}mi" if miles else None,), budget=budget))
+    if lower == "!pathy":
+        return _reply(cmd_path(path, path_bytes_per_hop, transit_ms), ascii_only=True)
+    if lower == "!packet":
+        return _reply(cmd_packet(kwargs.get("packet_hash")))
+    if lower in ("!pathall", "!patha", "!heard"):
+        result = cmd_pathall(channel_key, sender_key, kwargs.get("message_id"), is_dm)
+        if isinstance(result, str):
+            return _reply(result)
+        return _pathall_reply(result, sender_name, is_dm)
+    if lower == "!pathz":
+        result = cmd_pathall(channel_key, sender_key, kwargs.get("message_id"), is_dm)
+        if isinstance(result, str):
+            return _reply(_ascii_only(result), ascii_only=True)
+        return _pathall_reply(result, sender_name, is_dm, ascii_only=True)
+    if lower in ("!pathx", "!longpath", "!bigpath", "!pathxkm"):
+        units = "km" if lower == "!pathxkm" else "mi"
+        result = cmd_pathx(path, path_bytes_per_hop, sender_key, units=units)
         if isinstance(result, str):
             return _reply(result)
         filtered = _content_filter(result)
@@ -3333,7 +3859,7 @@ def bot(**kwargs) -> str | list[str] | None:
         return _stamp(cmd_about())
     if lower == "!docs":
         return _stamp(cmd_docs())
-    if lower == "!help":
+    if lower in ("!help", "help"):
         return _stamp(cmd_help())
     if lower == "!help2":
         return _stamp(cmd_help2())
@@ -3343,27 +3869,27 @@ def bot(**kwargs) -> str | list[str] | None:
         loc = _arg()
         if not loc:
             return _reply("Usage: !weather <location> (e.g. !weather sf)")
-        return _reply(cmd_weather(_expand_location(loc)))
+        return _reply(_place_retry(cmd_weather, _expand_location(loc)))
     if lower in ("!weatherc", "!wc") or lower.startswith(("!weatherc ", "!wc ")):
         loc = _arg()
         if not loc:
             return _reply("Usage: !weatherc <location> (e.g. !weatherc sf)")
-        return _reply(cmd_weather(_expand_location(loc), units="c"))
+        return _reply(_place_retry(cmd_weather, _expand_location(loc), units="c"))
     if lower == "!forecast" or lower.startswith("!forecast ") or lower == "!fc" or lower.startswith("!fc "):
         loc = _arg()
         if not loc:
             return _reply("Usage: !forecast <location> (e.g. !forecast sf)")
-        return _reply(cmd_forecast(_expand_location(loc)))
+        return _reply(_place_retry(cmd_forecast, _expand_location(loc)))
     if lower == "!forecastc" or lower.startswith("!forecastc ") or lower == "!fcc" or lower.startswith("!fcc "):
         loc = _arg()
         if not loc:
             return _reply("Usage: !forecastc <location> (e.g. !forecastc sf)")
-        return _reply(cmd_forecast(_expand_location(loc), units="c"))
+        return _reply(_place_retry(cmd_forecast, _expand_location(loc), units="c"))
     if lower == "!sun" or lower.startswith("!sun "):
         loc = _arg()
         if not loc:
             return _reply("Usage: !sun <location> (e.g. !sun sf)")
-        return _reply(cmd_sun(_expand_location(loc)))
+        return _reply(_place_retry(cmd_sun, _expand_location(loc)))
     if lower == "!tide" or lower.startswith("!tide ") or lower == "!surf" or lower.startswith("!surf "):
         loc = _arg()
         if not loc:
@@ -3479,8 +4005,10 @@ def bot(**kwargs) -> str | list[str] | None:
         return _stamp(cmd_tfr())
     if lower in ("!otd", "!onthisday", "!today"):
         return _stamp(cmd_otd())
-    if lower == "!who" or lower.startswith("!who "):
-        result = cmd_who(_arg(""))
+    if lower in ("!where", "!whereis") or lower.startswith(("!where ", "!whereis ")):
+        return _reply(cmd_where(_arg("")))
+    if lower in ("!who", "!whois") or lower.startswith(("!who ", "!whois ")):
+        result = cmd_whois(_arg(""))
         if isinstance(result, str):
             return _reply(result)
         filtered = _content_filter(result)
@@ -3488,8 +4016,10 @@ def bot(**kwargs) -> str | list[str] | None:
             return None
         filtered = filtered[:_MAX_MESSAGES]
         if sender_name and not is_dm and filtered:
-            filtered = [f"@[{sender_name}] {filtered[0]}"] + filtered[1:]
+            filtered = [f"@[{sender_name}]\n{filtered[0]}"] + filtered[1:]
         return _safe(filtered)
+    if lower == "!news" or lower.startswith("!news "):
+        return _reply(cmd_news(_expand_location(_arg(""))))
     if lower == "!zip" or lower.startswith("!zip "):
         return _stamp(cmd_zip(_arg("")))
     if lower == "!set" or lower.startswith("!set "):
@@ -3502,8 +4032,19 @@ def bot(**kwargs) -> str | list[str] | None:
         return _reply(cmd_advert())
     if lower in ("!power", "!outage", "!outages"):
         return _stamp(cmd_power())
-    if lower == "!stats":
+    _mcm_cmd = lower.split()[0] if lower else ""
+    if _arg() and (_mcm_cmd in ("!mcmonday", "!mcmondaycity") or
+                   (_mcm_cmd in ("!stats", "!statscity") and channel_name == "#mcmonday")):
+        return _spaced(_stamp(cmd_mcmonday(query=_arg())), channel_key)
+    if lower == "!mcmonday" or (lower == "!stats" and channel_name == "#mcmonday"):
+        return _spaced(_stamp(cmd_mcmonday()), channel_key)
+    if lower in ("!mcmondaya", "!mcmondayall") or \
+            (lower in ("!statsa", "!statsall") and channel_name == "#mcmonday"):
+        return _spaced(_stamp(cmd_mcmonday(all_time=True)), channel_key)
+    if lower == "!meshstats" or (lower == "!stats" and channel_name == "#path"):
         return _stamp(cmd_stats())
+    if lower == "!stats":
+        return _stamp(cmd_botstats())
     if lower == "!score" or lower.startswith("!score "):
         return _reply(cmd_score(_arg("")))
     if lower in ("!leaderboard", "!lb"):
@@ -3523,3 +4064,55 @@ def bot(**kwargs) -> str | list[str] | None:
         return random.choice(["Yeah?", "What?"])
 
     return None
+
+
+_BSTATS_FILE = "data/blorko_stats.json"  # {"since", "cmds": {word: n}, "users": {name: n}, "days": {date: n}}
+_BSTATS_TESTS = ("test", "!test", "ping", "!ping", "pathbot", "path")
+
+
+def _bstats_record(kwargs):
+    if kwargs.get("channel_name"):
+        word = (kwargs.get("message_text") or "").strip().lower().split(" ", 1)[0]
+        if not (word.startswith("!") or word in _BSTATS_TESTS):
+            word = "other"  # trivia answers etc.
+    else:
+        word = "DM"
+    try:
+        with open(_BSTATS_FILE) as f:
+            st = json.load(f)
+    except Exception:
+        st = {"since": int(time.time()), "cmds": {}, "users": {}, "days": {}}
+    who = kwargs.get("sender_name") or kwargs.get("sender_key") or "?"
+    day = datetime.now(_PT).date().isoformat()
+    for k, v in (("cmds", word), ("users", who), ("days", day)):
+        st[k][v] = st[k].get(v, 0) + 1
+    os.makedirs(os.path.dirname(_BSTATS_FILE), exist_ok=True)
+    with open(_BSTATS_FILE, "w") as f:
+        json.dump(st, f)
+
+
+def cmd_botstats():
+    try:
+        with open(_BSTATS_FILE) as f:
+            st = json.load(f)
+    except Exception:
+        return "no bot stats yet"
+    cmds = st["cmds"]
+    since = datetime.fromtimestamp(st["since"], _PT)
+    today = st["days"].get(datetime.now(_PT).date().isoformat(), 0)
+    tests = sum(cmds.get(w, 0) for w in _BSTATS_TESTS)
+    top = sorted(((w, n) for w, n in cmds.items() if w not in ("DM", "other")), key=lambda kv: -kv[1])
+    return [f"🦑 BlorkoBot since {since.month}/{since.day}: {sum(cmds.values()):,} replies to "
+            f"{len(st['users']):,} people, {today} today. {tests:,} tests, {cmds.get('DM', 0):,} DMs",
+            "Top: " + ", ".join(f"{w} {n:,}" for w, n in top[:8])]
+
+
+def bot(**kwargs) -> str | list[str] | None:
+    """Dispatch via _bot and count every reply for !stats."""
+    result = _bot(**kwargs)
+    if result is not None:
+        try:
+            _bstats_record(kwargs)
+        except Exception:
+            logging.getLogger("megabot.bstats").exception("bot stats record failed")
+    return result
